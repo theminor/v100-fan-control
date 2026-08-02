@@ -18,29 +18,37 @@ import sys
 import signal
 import logging
 import argparse
+import glob
 from datetime import datetime
 
 # --- CONFIGURATION ---
+
+def get_hwmon_base():
+    """Finds the dynamic hwmon directory for the specific ITE chip."""
+    # The physical device address 'it87.2832' stays constant across reboots
+    paths = glob.glob("/sys/devices/platform/it87.2832/hwmon/hwmon*/")
+    if paths:
+        return paths[0]
+    else:
+        # If the driver hasn't loaded yet on boot, exit so systemd can retry
+        print("Error: Could not find the it87.2832 hardware monitor path. Retrying...", file=sys.stderr)
+        sys.exit(1)
+
+BASE_PATH = get_hwmon_base()
 
 # Map NVIDIA GPU Index to the corresponding motherboard PWM file.
 # CRITICAL: Verify each fan is mapped to the correct GPU!
 #   - Set all to 255, then unplug one blower at a time.
 #   - The one that stops tells you which GPU that PWM controls.
-#
-# Found via the it87 driver (https://github.com/frankcrawford/it87.git):
-#   /sys/class/hwmon/hwmon5/pwm1 -> Fan header 1
-#   /sys/class/hwmon/hwmon5/pwm2 -> Fan header 2
-#
-# TODO: VERIFY MAPPING IS CORRECT BEFORE LEAVING UNATTENDED
 FAN_MAP = {
-    0: "/sys/class/hwmon/hwmon5/pwm2",  # GPU 0 (x16 slot, top V100)
-    1: "/sys/class/hwmon/hwmon5/pwm1",  # GPU 1 (x4 slot, middle V100)
+    0: os.path.join(BASE_PATH, "pwm2"),  # GPU 0 (x16 slot, top V100)
+    1: os.path.join(BASE_PATH, "pwm1"),  # GPU 1 (x4 slot, middle V100)
 }
 
 # Temperature curve parameters (per GPU, independent):
 TEMP_MIN = 40       # °C — fans at minimum below this
 TEMP_MAX = 75       # °C — fans at 100% above this
-PWM_MIN = 50        # PWM value (0-255) at TEMP_MIN
+PWM_MIN = 30        # PWM value (0-255) at TEMP_MIN
 PWM_MAX = 255       # PWM value (0-255) at TEMP_MAX
 POLL_INTERVAL = 3   # Seconds between temperature reads
 
@@ -79,9 +87,7 @@ def setup_logging():
 
     return logger
 
-
 logger = setup_logging()
-
 
 def enable_manual_mode():
     """Force motherboard fan headers into manual PWM control (disable BIOS curve)."""
@@ -108,7 +114,6 @@ def enable_manual_mode():
             logger.error(f"Error enabling manual mode for {enable_file}: {e}")
             sys.exit(1)
 
-
 def restore_bios_control():
     """Restore BIOS fan control by disabling manual PWM mode."""
     logger.info("Restoring BIOS fan control...")
@@ -123,7 +128,6 @@ def restore_bios_control():
         except Exception as e:
             logger.error(f"Error restoring BIOS control for {enable_file}: {e}")
 
-
 def graceful_shutdown(signum, frame):
     """Handle SIGINT/SIGTERM — restore BIOS control before exiting."""
     sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
@@ -131,7 +135,6 @@ def graceful_shutdown(signum, frame):
     restore_bios_control()
     logger.info("Fan control stopped. BIOS curve is now active.")
     sys.exit(0)
-
 
 def get_gpu_temps():
     """
@@ -171,7 +174,6 @@ def get_gpu_temps():
         logger.error(f"Error reading GPU temps: {e}")
     return temps
 
-
 def calculate_pwm(temp):
     """
     Map temperature to PWM value using a linear curve.
@@ -189,7 +191,6 @@ def calculate_pwm(temp):
     temp_percent = (temp - TEMP_MIN) / temp_range
     return int(PWM_MIN + (temp_percent * pwm_range))
 
-
 def set_fan_speed(gpu_idx, pwm_file, pwm_value):
     """Write PWM value to the motherboard fan header."""
     try:
@@ -199,7 +200,6 @@ def set_fan_speed(gpu_idx, pwm_file, pwm_value):
         logger.error(f"GPU {gpu_idx}: PWM file not found: {pwm_file}")
     except Exception as e:
         logger.error(f"GPU {gpu_idx}: Error writing PWM to {pwm_file}: {e}")
-
 
 def verify_fan_mapping():
     """Log a warning if mapping hasn't been verified yet."""
@@ -258,4 +258,3 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         restore_bios_control()
-
