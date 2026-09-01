@@ -25,21 +25,16 @@ from datetime import datetime
 
 def get_hwmon_base():
     """Finds the dynamic hwmon directory for the specific ITE chip."""
-    # The physical device address 'it87.2832' stays constant across reboots
     paths = glob.glob("/sys/devices/platform/it87.2832/hwmon/hwmon*/")
     if paths:
         return paths[0]
     else:
-        # If the driver hasn't loaded yet on boot, exit so systemd can retry
         print("Error: Could not find the it87.2832 hardware monitor path. Retrying...", file=sys.stderr)
         sys.exit(1)
 
 BASE_PATH = get_hwmon_base()
 
 # Map NVIDIA GPU Index to the corresponding motherboard PWM file.
-# CRITICAL: Verify each fan is mapped to the correct GPU!
-#   - Set all to 255, then unplug one blower at a time.
-#   - The one that stops tells you which GPU that PWM controls.
 FAN_MAP = {
     0: os.path.join(BASE_PATH, "pwm2"),  # GPU 0 (x16 slot, top V100)
     1: os.path.join(BASE_PATH, "pwm1"),  # GPU 1 (x4 slot, middle V100)
@@ -48,13 +43,17 @@ FAN_MAP = {
 # Temperature curve parameters (per GPU, independent):
 TEMP_MIN = 40       # °C — fans at minimum below this
 TEMP_MAX = 75       # °C — fans at 100% above this
-PWM_MIN = 30        # PWM value (0-255) at TEMP_MIN
+PWM_MIN = 30        # PWM value (0-255). 60 prevents 120mm blower stall.
 PWM_MAX = 255       # PWM value (0-255) at TEMP_MAX
 POLL_INTERVAL = 3   # Seconds between temperature reads
 
+# Smoothing parameters (Acoustic Management)
+MAX_STEP_UP = 85    # Max PWM increase per tick (ramps up quickly for safety)
+MAX_STEP_DOWN = 4   # Max PWM decrease per tick (coasts down slowly to stop revving)
+
 # Logging
 LOG_FILE = "/var/log/v100-fan.log"
-LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB before rotation
+LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 # ---------------------
 
@@ -65,21 +64,15 @@ def parse_args():
     return parser.parse_args()
 
 def setup_logging():
-    """Configure logging to both file and stdout."""
     from logging.handlers import RotatingFileHandler
-
     logger = logging.getLogger("v100-fan")
     logger.setLevel(logging.INFO)
 
-    # File handler with rotation
-    fh = RotatingFileHandler(
-        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
-    )
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     logger.addHandler(fh)
 
-    # Console handler (visible in journalctl)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
@@ -89,30 +82,22 @@ def setup_logging():
 
 logger = setup_logging()
 
-def enable_manual_mode():
-    """Force motherboard fan headers into manual PWM control (disable BIOS curve)."""
+def enable_manual_mode(initial_setup=False):
+    """Force motherboard fan headers into manual PWM control."""
     for gpu_idx, pwm_file in FAN_MAP.items():
         enable_file = f"{pwm_file}_enable"
         try:
-            # Read current state first
-            with open(enable_file, 'r') as f:
-                current = f.read().strip()
-            if current == '1':
-                logger.info(f"GPU {gpu_idx} fan already in manual mode ({enable_file})")
-                continue
-
             with open(enable_file, 'w') as f:
                 f.write('1')
-            logger.info(f"Enabled manual control for GPU {gpu_idx} fan ({enable_file})")
+            if initial_setup:
+                logger.info(f"Enabled manual control for GPU {gpu_idx} fan ({enable_file})")
         except PermissionError:
             logger.error("Permission denied: script must be run as root.")
             sys.exit(1)
-        except FileNotFoundError:
-            logger.error(f"File not found: {enable_file}. Check hwmon path.")
-            sys.exit(1)
         except Exception as e:
-            logger.error(f"Error enabling manual mode for {enable_file}: {e}")
-            sys.exit(1)
+            if initial_setup:
+                logger.error(f"Error enabling manual mode for {enable_file}: {e}")
+                sys.exit(1)
 
 def restore_bios_control():
     """Restore BIOS fan control by disabling manual PWM mode."""
@@ -137,13 +122,7 @@ def graceful_shutdown(signum, frame):
     sys.exit(0)
 
 def get_gpu_temps():
-    """
-    Read GPU core AND memory temps from nvidia-smi.
-    Returns dict of {gpu_index: max(core_temp, memory_temp)}.
-
-    Using max(core, memory) because memory can run 3-15°C hotter
-    than the core, and the BIOS curve can't see it anyway.
-    """
+    """Read GPU core AND memory temps from nvidia-smi."""
     temps = {}
     try:
         output = subprocess.check_output(
@@ -164,95 +143,96 @@ def get_gpu_temps():
             idx = int(parts[0].strip())
             core_temp = int(parts[1].strip())
             mem_temp = int(parts[2].strip())
-            # Use the hotter sensor — if memory is running hot, fans should respond
             temps[idx] = max(core_temp, mem_temp)
     except subprocess.TimeoutExpired:
         logger.error("nvidia-smi timed out")
     except subprocess.CalledProcessError as e:
-        logger.error(f"nvidia-smi failed (rc={e.returncode}): {e.output}")
+        logger.error(f"nvidia-smi failed (rc={e.returncode}): {e.output.strip()}")
     except Exception as e:
         logger.error(f"Error reading GPU temps: {e}")
     return temps
 
 def calculate_pwm(temp):
-    """
-    Map temperature to PWM value using a linear curve.
-
-    temp <= TEMP_MIN → PWM_MIN
-    temp >= TEMP_MAX → PWM_MAX
-    Otherwise: linear interpolation
-    """
-    if temp <= TEMP_MIN:
-        return PWM_MIN
-    if temp >= TEMP_MAX:
-        return PWM_MAX
+    """Map temperature to PWM value using a linear curve."""
+    if temp <= TEMP_MIN: return PWM_MIN
+    if temp >= TEMP_MAX: return PWM_MAX
     temp_range = TEMP_MAX - TEMP_MIN
     pwm_range = PWM_MAX - PWM_MIN
     temp_percent = (temp - TEMP_MIN) / temp_range
     return int(PWM_MIN + (temp_percent * pwm_range))
 
 def set_fan_speed(gpu_idx, pwm_file, pwm_value):
-    """Write PWM value to the motherboard fan header."""
+    """Write PWM value, overriding BIOS resets unconditionally."""
     try:
+        # Unconditionally enforce manual mode right before writing
+        # (BIOS SMM can silently change hardware without updating sysfs)
+        enable_file = f"{pwm_file}_enable"
+        with open(enable_file, 'w') as ew:
+            ew.write('1')
+
+        # Set the speed
         with open(pwm_file, 'w') as f:
             f.write(str(pwm_value))
-    except FileNotFoundError:
-        logger.error(f"GPU {gpu_idx}: PWM file not found: {pwm_file}")
     except Exception as e:
         logger.error(f"GPU {gpu_idx}: Error writing PWM to {pwm_file}: {e}")
 
-def verify_fan_mapping():
-    """Log a warning if mapping hasn't been verified yet."""
-    logger.info(
-        "FAN MAPPING: GPU 0 -> %s, GPU 1 -> %s. "
-        "Verify by setting fans to 255 and unplugging each blower to confirm.",
-        FAN_MAP.get(0, "N/A"),
-        FAN_MAP.get(1, "N/A"),
-    )
-
 if __name__ == "__main__":
     args = parse_args()
-
-    # Re-create logger with appropriate level
-    logger = logging.getLogger("v100-fan")
-    if args.debug:
-        logger.setLevel(logging.INFO)
-    else:
-        logger.setLevel(logging.WARNING)  # Only errors + warnings
+    logger.setLevel(logging.INFO if args.debug else logging.WARNING)
 
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
     logger.info("=" * 60)
     logger.info("V100 Fan Control starting (debug=%s)", args.debug)
-    logger.info("Curve: %d°C→PWM %d, %d°C→PWM %d", TEMP_MIN, PWM_MIN, TEMP_MAX, PWM_MAX)
-    logger.info("Poll interval: %ds", POLL_INTERVAL)
-    verify_fan_mapping()
-    enable_manual_mode()
+    enable_manual_mode(initial_setup=True)
     logger.info("Fan control loop started")
+
+    consecutive_errors = 0
+    current_pwms = {}  # Tracks the actual running speed of each fan
 
     try:
         while True:
             gpu_temps = get_gpu_temps()
 
             if gpu_temps:
+                consecutive_errors = 0  # Reset counter on success
                 for gpu_idx, temp in gpu_temps.items():
                     if gpu_idx in FAN_MAP:
                         target_pwm = calculate_pwm(temp)
-                        set_fan_speed(gpu_idx, FAN_MAP[gpu_idx], target_pwm)
 
-                # Debug-only logging
-                if args.debug:
-                    temp_summary = ", ".join(
-                        f"GPU{i}:{gpu_temps[i]}°C" for i in sorted(gpu_temps)
-                    )
-                    pwm_summary = ", ".join(
-                        f"GPU{i}:{calculate_pwm(gpu_temps[i])}"
-                        for i in sorted(gpu_temps) if i in FAN_MAP
-                    )
-                    logger.info("Temps: %s | PWM: %s", temp_summary, pwm_summary)
+                        # Initialize tracking on the first loop
+                        if gpu_idx not in current_pwms:
+                            current_pwms[gpu_idx] = target_pwm
+
+                        # Acoustic Smoothing Logic
+                        diff = target_pwm - current_pwms[gpu_idx]
+
+                        if diff > 0:
+                            # Needs to speed up - limit the jump to MAX_STEP_UP
+                            step = min(diff, MAX_STEP_UP)
+                        elif diff < 0:
+                            # Needs to slow down - limit the drop to MAX_STEP_DOWN
+                            step = max(diff, -MAX_STEP_DOWN)
+                        else:
+                            step = 0
+ 
+                        smoothed_pwm = current_pwms[gpu_idx] + step
+                        current_pwms[gpu_idx] = smoothed_pwm
+
+                        set_fan_speed(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
+
+                        # Added to debug output so you can watch the smoothing in real-time
+                        if args.debug and step != 0:
+                            logger.info(f"GPU {gpu_idx}: Temp={temp}°C | Target={target_pwm} | Actual={smoothed_pwm} (Step: {step})")
+
             else:
-                logger.warning("No GPU temps read — skipping this cycle")
+                consecutive_errors += 1
+                logger.warning(f"No GPU temps read (Error #{consecutive_errors}) — skipping cycle")
+
+                if consecutive_errors >= 10:
+                    logger.error("Continuous NVML failures detected. Forcing service restart to clear driver state...")
+                    sys.exit(1)
 
             time.sleep(POLL_INTERVAL)
 
