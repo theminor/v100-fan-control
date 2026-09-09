@@ -100,13 +100,19 @@ def get_available_pwm_channels():
 
     Returns a sorted list of (pwm_number, pwm_file) tuples,
     e.g., [(1, '/sys/.../pwm1'), (2, '/sys/.../pwm2'), ...].
+
+    Filters to only files named exactly 'pwm' followed by digits
+    (ignoring files like 'pwm3_auto_point1_temp').
     """
-    pwm_files = sorted(
-        glob.glob(os.path.join(BASE_PATH, "pwm*")),
-        key=lambda p: int(p.replace(BASE_PATH, "").replace("pwm", "")),
-    )
-    return [(int(pwm_file.replace(BASE_PATH, "").replace("pwm", "")), pwm_file)
-            for pwm_file in pwm_files]
+    all_files = glob.glob(os.path.join(BASE_PATH, "pwm*"))
+    pwm_files = []
+    for fpath in all_files:
+        name = os.path.basename(fpath)
+        if name.startswith("pwm"):
+            num_str = name[3:]
+            if num_str.isdigit():
+                pwm_files.append((int(num_str), fpath))
+    return sorted(pwm_files, key=lambda x: x[0])
 
 
 def discover_all_gpus():
