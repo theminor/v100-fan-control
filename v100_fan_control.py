@@ -9,22 +9,22 @@ Repo: https://github.com/theminor/v100-fan-control
 Reads GPU core + memory temps from nvidia-smi and controls
 motherboard PWM fan headers via /sys/class/hwmon/.
 
-Each V100 has its own dedicated blower fan, independently controlled.
+Each GPU has its own dedicated blower fan, independently controlled.
 Uses the MAX of core and memory temp per GPU (memory often runs hotter).
 
 Designed to run as a systemd service (v100-fan-control.service).
 On graceful shutdown, restores BIOS fan control.
 
 Hardware notes:
-  - Tested on Gigabyte Z690 AORUS PRO (it87 Super I/O chip)
-  - Dual NVIDIA Tesla V100 (x16 + x4 slots)
-  - Requires the it87 kernel module for fan header access
-  - Run as root (sudo) — needs write access to /sys/class/hwmon/
+  - Requires nvidia-smi and the it87 (or compatible) kernel module
+  - Requires root (sudo) — needs write access to /sys/class/hwmon/
+  - Supports any number of GPUs (1, 2, 3, 4, 5+) — limited only by
+    the number of PWM channels available on the motherboard
 
 Quick start:
   1. Install it87 driver: sudo apt install lm-sensors && sudo sensors-detect
-  2. Verify hwmon path: ls /sys/devices/platform/it87.2832/hwmon/hwmon*/
-  3. Verify fan mapping (see FAN_MAP below)
+  2. Verify hwmon path: ls /sys/devices/platform/<chip>/hwmon/hwmon*/
+  3. Verify fan mapping (see FAN_MAP section below)
   4. Run: sudo python3 v100_fan_control.py --debug
   5. If happy, set up as a systemd service (see README)
 """
@@ -41,6 +41,11 @@ import glob
 # ============================================================
 #  SETTINGS — Edit these for your hardware
 # ============================================================
+
+# --- Hardware detection ---
+# The Super I/O chip name (e.g., it87.2832, it8620e.2560, nct6775.2560).
+# Leave as default if it works; change if your motherboard uses a different chip.
+HWMON_DEVICE = "it87.2832"
 
 # --- Temperature curve ---
 # Fans run at PWM_MIN when temp is at or below TEMP_MIN.
@@ -64,22 +69,24 @@ LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB before rotation
 LOG_BACKUP_COUNT = 3
 
 # ============================================================
-#  FAN MAP — Verify this matches your hardware!
+#  FAN MAP — Auto-detected + user verification
 # ============================================================
 
 def get_hwmon_base():
     """Finds the dynamic hwmon directory for the specific ITE chip.
 
-    The physical device address 'it87.2832' stays constant across reboots.
+    The physical device address (e.g., it87.2832) stays constant across reboots.
     The hwmonN suffix (hwmon3, hwmon5, etc.) may change, so we glob to find it.
     """
-    paths = glob.glob("/sys/devices/platform/it87.2832/hwmon/hwmon*/")
+    pattern = f"/sys/devices/platform/{HWMON_DEVICE}/hwmon/hwmon*/"
+    paths = glob.glob(pattern)
     if paths:
         return paths[0]
     else:
         print(
-            "Error: Could not find the it87.2832 hardware monitor path. "
-            "Is the it87 module loaded? (lsmod | grep it87)",
+            f"Error: Could not find hwmon path for '{HWMON_DEVICE}'. "
+            "Check the HWMON_DEVICE setting and verify the driver is loaded: "
+            "lsmod | grep <driver_name>",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -87,28 +94,71 @@ def get_hwmon_base():
 
 BASE_PATH = get_hwmon_base()
 
-# Map NVIDIA GPU Index to the corresponding motherboard PWM file.
-#
-# CRITICAL: Verify each fan is mapped to the correct GPU!
-#   1. Set all fans to 255 (full speed).
-#   2. Unplug one blower cable at a time.
-#   3. The fan that stops tells you which GPU index that PWM controls.
-#
-# Found via the it87 driver (https://github.com/frankcrawford/it87.git):
-#   /sys/class/hwmon/hwmon5/pwm1 -> Fan header 1
-#   /sys/class/hwmon/hwmon5/pwm2 -> Fan header 2
-#
-FAN_MAP = {
-    0: os.path.join(BASE_PATH, "pwm2"),  # GPU 0 (x16 slot, top V100)
-    1: os.path.join(BASE_PATH, "pwm1"),  # GPU 1 (x4 slot, middle V100)
-}
+
+def get_available_pwm_channels():
+    """Discover all PWM channels available on the motherboard.
+
+    Returns a sorted list of (pwm_number, pwm_file) tuples,
+    e.g., [(1, '/sys/.../pwm1'), (2, '/sys/.../pwm2'), ...].
+    """
+    pwm_files = sorted(
+        glob.glob(os.path.join(BASE_PATH, "pwm*")),
+        key=lambda p: int(p.replace(BASE_PATH, "").replace("pwm", "")),
+    )
+    return [(int(pwm_file.replace(BASE_PATH, "").replace("pwm", "")), pwm_file)
+            for pwm_file in pwm_files]
+
+
+def discover_all_gpus():
+    """Query nvidia-smi to find all GPUs on the system.
+
+    Returns a sorted list of GPU indices.
+    """
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            encoding="utf-8",
+            timeout=10,
+        )
+        indices = [int(line.strip()) for line in output.strip().split("\n") if line.strip()]
+        return sorted(indices)
+    except Exception as e:
+        logger.error(f"Error discovering GPUs: {e}")
+        sys.exit(1)
+
+
+# Build dynamic FAN_MAP: GPU 0 -> PWM 1, GPU 1 -> PWM 2, etc.
+# If there are more GPUs than PWM channels, the extras will be skipped.
+AVAILABLE_PWMS = get_available_pwm_channels()
+GPU_INDICES = discover_all_gpus()
+
+# Build the mapping
+FAN_MAP = {}
+for i, gpu_idx in enumerate(GPU_INDICES):
+    if i < len(AVAILABLE_PWMS):
+        pwm_num, pwm_file = AVAILABLE_PWMS[i]
+        FAN_MAP[gpu_idx] = pwm_file
+    else:
+        logger.warning(
+            "GPU %d has no available PWM channel — skipping. "
+            "You have %d GPUs but only %d PWM channels.",
+            gpu_idx, len(GPU_INDICES), len(AVAILABLE_PWMS),
+        )
+
+# Verify we have at least one mapping
+if not FAN_MAP:
+    logger.error(
+        "No GPU-to-PWM mappings found. "
+        "Check that HWMON_DEVICE is correct and PWM channels exist."
+    )
+    sys.exit(1)
 
 # ============================================================
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="V100 GPU Fan Control — automatic PWM fan curve for NVIDIA V100s"
+        description="V100 GPU Fan Control — automatic PWM fan curve for NVIDIA GPUs"
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -145,7 +195,7 @@ logger = setup_logging()
 def enable_manual_mode(initial_setup=False):
     """Force motherboard fan headers into manual PWM control.
 
-    The it87 driver exposes an *_enable file per PWM channel.
+    The Super I/O driver exposes an *_enable file per PWM channel.
     Setting it to '1' disables the BIOS fan curve and lets us
     write PWM values directly.
     """
@@ -155,13 +205,13 @@ def enable_manual_mode(initial_setup=False):
             with open(enable_file, 'w') as f:
                 f.write('1')
             if initial_setup:
-                logger.info(f"Enabled manual control for GPU {gpu_idx} fan ({enable_file})")
+                logger.info("Enabled manual control for GPU %d fan (%s)", gpu_idx, enable_file)
         except PermissionError:
             logger.error("Permission denied: script must be run as root.")
             sys.exit(1)
         except Exception as e:
             if initial_setup:
-                logger.error(f"Error enabling manual mode for {enable_file}: {e}")
+                logger.error("Error enabling manual mode for %s: %s", enable_file, e)
                 sys.exit(1)
 
 
@@ -173,17 +223,17 @@ def restore_bios_control():
         try:
             with open(enable_file, 'w') as f:
                 f.write('0')
-            logger.info(f"Restored BIOS control for GPU {gpu_idx} fan ({enable_file})")
+            logger.info("Restored BIOS control for GPU %d fan (%s)", gpu_idx, enable_file)
         except FileNotFoundError:
-            logger.warning(f"File not found on shutdown: {enable_file}")
+            logger.warning("File not found on shutdown: %s", enable_file)
         except Exception as e:
-            logger.error(f"Error restoring BIOS control for {enable_file}: {e}")
+            logger.error("Error restoring BIOS control for %s: %s", enable_file, e)
 
 
 def graceful_shutdown(signum, frame):
     """Handle SIGINT/SIGTERM — restore BIOS control before exiting."""
     sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
-    logger.info(f"Received {sig_name} — shutting down gracefully...")
+    logger.info("Received %s — shutting down gracefully...", sig_name)
     restore_bios_control()
     logger.info("Fan control stopped. BIOS curve is now active.")
     sys.exit(0)
@@ -223,9 +273,9 @@ def get_gpu_temps():
     except subprocess.TimeoutExpired:
         logger.error("nvidia-smi timed out")
     except subprocess.CalledProcessError as e:
-        logger.error(f"nvidia-smi failed (rc={e.returncode}): {e.output.strip()}")
+        logger.error("nvidia-smi failed (rc=%d): %s", e.returncode, e.output.strip())
     except Exception as e:
-        logger.error(f"Error reading GPU temps: {e}")
+        logger.error("Error reading GPU temps: %s", e)
     return temps
 
 
@@ -261,7 +311,7 @@ def set_fan_speed(gpu_idx, pwm_file, pwm_value):
         with open(pwm_file, 'w') as f:
             f.write(str(pwm_value))
     except Exception as e:
-        logger.error(f"GPU {gpu_idx}: Error writing PWM to {pwm_file}: {e}")
+        logger.error("GPU %d: Error writing PWM to %s: %s", gpu_idx, pwm_file, e)
 
 
 if __name__ == "__main__":
@@ -273,15 +323,21 @@ if __name__ == "__main__":
 
     logger.info("=" * 60)
     logger.info("V100 Fan Control starting (debug=%s)", args.debug)
+    logger.info("HWMON device: %s", HWMON_DEVICE)
+    logger.info("GPU count: %d, PWM channels available: %d",
+                len(GPU_INDICES), len(AVAILABLE_PWMS))
     logger.info("Curve: %d°C→PWM %d, %d°C→PWM %d", TEMP_MIN, PWM_MIN, TEMP_MAX, PWM_MAX)
     logger.info("Smoothing: max step up=%d, max step down=%d", MAX_STEP_UP, MAX_STEP_DOWN)
     logger.info("Poll interval: %ds", POLL_INTERVAL)
+
+    # Print the auto-detected mapping
+    logger.info("Auto-detected fan mapping:")
+    for gpu_idx, pwm_file in FAN_MAP.items():
+        logger.info("  GPU %d -> %s", gpu_idx, os.path.basename(pwm_file))
+
     logger.info(
-        "FAN MAPPING: GPU 0 -> %s, GPU 1 -> %s",
-        FAN_MAP.get(0, "N/A"),
-        FAN_MAP.get(1, "N/A"),
+        "Verify mapping by setting fans to 255 and unplugging each blower."
     )
-    logger.info("Verify mapping by setting fans to 255 and unplugging each blower.")
     enable_manual_mode(initial_setup=True)
     logger.info("Fan control loop started")
 

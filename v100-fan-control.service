@@ -1,0 +1,22 @@
+[Unit]
+Description=GPU Fan Control — automatic PWM fan curve for NVIDIA GPUs
+After=systemd-modules-load.service nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+
+# Wait until all GPUs are alive and responsive
+# nvidia-smi -L lists all GPUs; we wait until the output contains at least one GPU
+ExecStartPre=/bin/bash -c "until nvidia-smi -L 2>/dev/null; do sleep 1; done"
+
+ExecStart=/usr/bin/python3 /opt/v100-fan-control/v100_fan_control.py
+
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
