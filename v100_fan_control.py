@@ -69,8 +69,28 @@ LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB before rotation
 LOG_BACKUP_COUNT = 3
 
 # ============================================================
-#  FAN MAP — Auto-detected + user verification
+#  FAN MAP — User-defined GPU-to-PWM assignments
 # ============================================================
+
+# Map each GPU index (from nvidia-smi) to its motherboard PWM channel number.
+# The number corresponds to pwm1, pwm2, pwm3, etc. on your motherboard.
+#
+# THIS DICT DICTATES YOUR FAN MAPPING. Adjust the PWM channel numbers
+# to match your physical wiring. Swap the numbers if fans are backwards.
+#
+# Example for 2 GPUs where GPU 0 (x16 slot) is wired to PWM 2
+# and GPU 1 (x4 slot) is wired to PWM 1:
+#   GPU_TO_PWM = {0: 2, 1: 1}
+#
+# Example for 3 GPUs all wired sequentially (GPU 0→PWM 1, GPU 1→PWM 2, etc.):
+#   GPU_TO_PWM = {0: 1, 1: 2, 2: 3}
+#
+# Add or remove entries as needed for your GPU count.
+GPU_TO_PWM = {
+    0: 2,  # GPU 0 (x16 slot) → PWM channel 2
+    1: 1,  # GPU 1 (x4 slot) → PWM channel 1
+}
+
 
 def get_hwmon_base():
     """Finds the dynamic hwmon directory for the specific ITE chip.
@@ -133,30 +153,46 @@ def discover_all_gpus():
         sys.exit(1)
 
 
-# Build dynamic FAN_MAP: GPU 0 -> PWM 1, GPU 1 -> PWM 2, etc.
-# If there are more GPUs than PWM channels, the extras will be skipped.
+# Build the FAN_MAP by looking up each GPU-to-PWM assignment.
+# This validates that every assigned PWM channel exists on the motherboard.
 AVAILABLE_PWMS = get_available_pwm_channels()
 GPU_INDICES = discover_all_gpus()
 
-# Build the mapping
+# Create a lookup: PWM channel number → file path
+PWM_CHANNEL_TO_FILE = {pwm_num: pwm_file for pwm_num, pwm_file in AVAILABLE_PWMS}
+
 FAN_MAP = {}
-for i, gpu_idx in enumerate(GPU_INDICES):
-    if i < len(AVAILABLE_PWMS):
-        pwm_num, pwm_file = AVAILABLE_PWMS[i]
-        FAN_MAP[gpu_idx] = pwm_file
+for gpu_idx, pwm_num in GPU_TO_PWM.items():
+    if pwm_num in PWM_CHANNEL_TO_FILE:
+        FAN_MAP[gpu_idx] = PWM_CHANNEL_TO_FILE[pwm_num]
     else:
+        logger.error(
+            "PWM channel %d is assigned to GPU %d but does not exist. "
+            "Check GPU_TO_PWM assignment. Available channels: %s",
+            pwm_num, gpu_idx, [p for p, _ in AVAILABLE_PWMS],
+        )
+        sys.exit(1)
+
+# Verify all assigned GPUs are actually present
+for gpu_idx in GPU_TO_PWM:
+    if gpu_idx not in GPU_INDICES:
         logger.warning(
-            "GPU %d has no available PWM channel — skipping. "
-            "You have %d GPUs but only %d PWM channels.",
-            gpu_idx, len(GPU_INDICES), len(AVAILABLE_PWMS),
+            "GPU %d is assigned in GPU_TO_PWM but not found by nvidia-smi. "
+            "It will be ignored.",
+            gpu_idx,
         )
 
-# Verify we have at least one mapping
+# Verify all present GPUs have a mapping
+for gpu_idx in GPU_INDICES:
+    if gpu_idx not in GPU_TO_PWM:
+        logger.warning(
+            "GPU %d was found by nvidia-smi but has no PWM assignment. "
+            "Add it to GPU_TO_PWM if you want it controlled.",
+            gpu_idx,
+        )
+
 if not FAN_MAP:
-    logger.error(
-        "No GPU-to-PWM mappings found. "
-        "Check that HWMON_DEVICE is correct and PWM channels exist."
-    )
+    logger.error("No valid GPU-to-PWM mappings. Check GPU_TO_PWM assignment.")
     sys.exit(1)
 
 # ============================================================
