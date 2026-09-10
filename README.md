@@ -7,12 +7,12 @@ Reads GPU core + memory temperatures via `nvidia-smi` and writes PWM values to m
 ## Features
 
 - **Auto-detects GPUs** — queries `nvidia-smi` to find all GPUs on the system (1, 2, 3, 4, 5+)
-- **Auto-maps PWM channels** — discovers available PWM channels on the motherboard and assigns them sequentially to GPUs (GPU 0 → PWM 1, GPU 1 → PWM 2, etc.)
+- **Auto-discovers hwmon path** — finds the Super I/O hwmon directory via glob, survives reboot renumbering
+- **User-defined fan mapping** — explicit GPU-to-PWM assignment via `GPU_TO_PWM` dict (no guessing)
 - **Linear temperature curve** — configurable min/max temperature and PWM thresholds
 - **Memory temp monitoring** — uses the hotter of core or memory temp (HBM memory often runs hotter than the core)
 - **Acoustic smoothing** — limits PWM step size per cycle to prevent audible fan "revving" (ramps up fast for safety, coasts down slowly)
 - **Graceful shutdown** — restores BIOS fan control on SIGINT/SIGTERM
-- **Dynamic hwmon discovery** — auto-finds the Super I/O hwmon path via glob, survives reboot renumbering
 - **BIOS override enforcement** — re-enforces manual mode each cycle to counter BIOS SMM reversion
 - **Error recovery** — auto-restarts after 10 consecutive nvidia-smi failures to clear NVML driver state
 - **Rotating log files** — 5 MB max, 3 backups
@@ -52,39 +52,74 @@ sudo sensors-detect   # Answer YES to probing
 sudo git clone https://github.com/theminor/v100-fan-control.git /opt/v100-fan-control
 ```
 
-2. **Edit settings** in `/opt/v100-fan-control/v100_fan_control.py` if needed (default values work for most setups):
+2. **Verify fan-to-GPU mapping** (critical — wrong mapping = wrong fan on the hot GPU):
 
-```python
-# Temperature curve
-TEMP_MIN = 40       # °C — fans at minimum below this
-TEMP_MAX = 75       # °C — fans at 100% above this
-PWM_MIN = 30        # PWM value (0-255) at TEMP_MIN
-PWM_MAX = 255       # PWM value (0-255) at TEMP_MAX
+   a. **Temporarily set all fans to 255** (full speed) by adding `GPU_TO_PWM = {0: 1, 1: 1}` (or whatever channel exists) to force all assigned GPUs to max. Actually, the easiest way:
 
-# Smoothing
-MAX_STEP_UP = 85    # Max PWM increase per tick
-MAX_STEP_DOWN = 4   # Max PWM decrease per tick
-```
+   ```bash
+   # Run with --debug to see the mapping, then test physically
+   sudo python3 /opt/v100-fan-control/v100_fan_control.py --debug
+   ```
 
-3. **Verify fan-to-GPU mapping** (critical — wrong mapping = wrong fan on the hot GPU):
-   - Run the script with all fans at 255
-   - Unplug one blower cable at a time
-   - The fan that stops tells you which GPU index that PWM header controls
-   - If needed, adjust your motherboard's PWM channel assignments
+   b. **Unplug one blower cable at a time.** The fan that stops tells you which GPU index that PWM header controls.
+
+   c. **Update `GPU_TO_PWM`** in the script to match your physical wiring. For example, if GPU 0 (x16 slot) is wired to PWM 2 and GPU 1 (x4 slot) is wired to PWM 1:
+
+   ```python
+   GPU_TO_PWM = {
+       0: 2,  # GPU 0 → PWM channel 2
+       1: 1,  # GPU 1 → PWM channel 1
+   }
+   ```
+
+   Add or remove entries for your GPU count. The script validates that every assigned PWM channel exists and warns about any GPUs without assignments.
+
+3. **Edit other settings** if needed (defaults work for most setups):
+
+   ```python
+   # Temperature curve
+   TEMP_MIN = 40       # °C — fans at minimum below this
+   TEMP_MAX = 75       # °C — fans at 100% above this
+   PWM_MIN = 30        # PWM value (0-255) at TEMP_MIN
+   PWM_MAX = 255       # PWM value (0-255) at TEMP_MAX
+
+   # Smoothing
+   MAX_STEP_UP = 85    # Max PWM increase per tick
+   MAX_STEP_DOWN = 4   # Max PWM decrease per tick
+   ```
 
 4. **Test run** (dry run with debug logging):
 
-```bash
-sudo python3 /opt/v100-fan-control/v100_fan_control.py --debug
-```
+   ```bash
+   sudo python3 /opt/v100-fan-control/v100_fan_control.py --debug
+   ```
 
-Check the console output and `/var/log/v100-fan.log` to confirm temps and PWM values look reasonable.
+   Check the console output and `/var/log/v100-fan.log` to confirm temps and PWM values look reasonable.
 
 5. **When happy, set up as a systemd service** (see below).
 
 ## systemd Service
 
-Copy the service file into place:
+### Option A: Symlink (recommended)
+
+Keep the service file in the repo and symlink it into systemd's directory. This way, `git pull` updates the service file automatically:
+
+```bash
+# Remove any existing service file
+sudo rm -f /etc/systemd/system/v100-fan-control.service
+
+# Create a symlink from systemd's directory to the repo file
+sudo ln -s /opt/v100-fan-control/v100-fan-control.service /etc/systemd/system/v100-fan-control.service
+
+# Reload and enable
+sudo systemctl daemon-reload
+sudo systemctl enable v100-fan-control.service
+sudo systemctl start v100-fan-control.service
+```
+
+### Option B: Copy
+
+Copy the service file into systemd's directory:
 
 ```bash
 sudo cp /opt/v100-fan-control/v100-fan-control.service /etc/systemd/system/
@@ -93,17 +128,41 @@ sudo systemctl enable v100-fan-control.service
 sudo systemctl start v100-fan-control.service
 ```
 
-Check status:
+### Verify
 
 ```bash
 sudo systemctl status v100-fan-control.service
-```
-
-View logs:
-
-```bash
 sudo journalctl -u v100-fan-control.service -f
 ```
+
+## GPU-to-PWM Mapping
+
+The `GPU_TO_PWM` dict in the script explicitly maps each GPU index (from `nvidia-smi`) to its motherboard PWM channel number. This is the **only** place where hardware-specific wiring is defined.
+
+```python
+GPU_TO_PWM = {
+    0: 2,  # GPU 0 (x16 slot) → PWM channel 2
+    1: 1,  # GPU 1 (x4 slot) → PWM channel 1
+}
+```
+
+For more GPUs, just add entries:
+
+```python
+GPU_TO_PWM = {
+    0: 2,  # GPU 0 → PWM 2
+    1: 1,  # GPU 1 → PWM 1
+    2: 3,  # GPU 2 → PWM 3
+    3: 4,  # GPU 3 → PWM 4
+}
+```
+
+The script validates that:
+- Every assigned PWM channel exists on the motherboard (errors out if not)
+- Every assigned GPU is present (warns if not)
+- Every detected GPU has an assignment (warns if not)
+
+The hwmon path and available PWM channels are **auto-discovered** — you only need to specify the GPU-to-PWM mapping.
 
 ## Settings Reference
 
@@ -123,26 +182,6 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
 
-## How Auto-Mapping Works
-
-The script automatically discovers:
-
-1. **All GPUs** — via `nvidia-smi --query-gpu=index`
-2. **All PWM channels** — via glob on `/sys/devices/platform/<chip>/hwmon/hwmon*/pwm*`
-3. **Assigns GPU N → PWM N+1** sequentially
-
-For example, with 3 GPUs and 4 PWM channels:
-
-| GPU | PWM Channel |
-|---|---|
-| 0 | pwm1 |
-| 1 | pwm2 |
-| 2 | pwm3 |
-
-If there are more GPUs than PWM channels, the excess GPUs are skipped with a warning.
-
-**Verify this mapping** by running the script, setting all fans to 255, and unplugging cables one at a time to confirm each fan corresponds to the correct GPU.
-
 ## Troubleshooting
 
 - **"Permission denied"** — Run with `sudo`. The script needs write access to `/sys/class/hwmon/hwmon*/pwm*` and `*_enable` files.
@@ -150,7 +189,7 @@ If there are more GPUs than PWM channels, the excess GPUs are skipped with a war
 - **"nvidia-smi timed out"** — GPU driver may be hung. The script auto-restarts after 10 consecutive failures.
 - **Fans not responding** — The BIOS may have reverted the `*_enable` flag. The script re-enforces it each cycle, but you may also need to disable "Q-Fan Control" or "Hardware Monitor" in the BIOS.
 - **Fans revving up and down** — Increase `MAX_STEP_DOWN` or increase `POLL_INTERVAL` to give fans more time to settle between commands.
-- **Fewer PWM channels than GPUs** — The script will skip excess GPUs. Consider a PCIe fan controller or a motherboard with more headers.
+- **Fewer PWM channels than GPUs** — The script will skip unassigned GPUs. Consider a PCIe fan controller or a motherboard with more headers.
 
 ## License
 
