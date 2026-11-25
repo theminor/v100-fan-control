@@ -105,6 +105,15 @@ TACH_ERRORS_TO_ESCALATE = 3
 DELL_REENFORCE_S = 3600     # hard ceiling for same-value re-writes
 DELL_KICK_GRACE_S = 25      # after any write, tach is transitioning: don't judge
 TACH_DEV_SAMPLES = 3        # consecutive out-of-band settled reads -> re-issue
+# Level hysteresis: with kick-costly EC writes the smoothed duty oscillating
+# across a level boundary (load equilibrium temp near a threshold) produces a
+# kick every crossing — observed fan flapping under a 100 W burn. Dell mode
+# therefore only lets the commanded level DROP once the raw curve target is
+# LEVEL_HYST below the duty where the drop would happen; otherwise it holds
+# at the current level's floor. (Measured: level 2 engages at 192 duty = 52°C;
+# it then holds full fan until the target implies < ~46°C.)
+LEVEL_FLOOR = (0, 112, 192)  # min duty of EC levels 0, 1, 2
+LEVEL_HYST = 15              # duty of extra clearance required to drop a level
 # Settled RPM bands by commanded duty (T5810 PCIe blower, Low mode; the EC
 # quantizes: canonical levels ~<112 → ≈130 RPM (often below the tach's
 # readable floor), 112–191 → ≈505 RPM, ≥192 → ≈4100 RPM):
@@ -361,8 +370,9 @@ def set_fan_speed(gpu_idx, pwm_file, pwm_value):
 
 
 # Dell-mode write pacing state
-last_command = {}        # gpu_idx -> last duty written
+last_command = {}        # gpu_idx -> last duty value passed to the writer
 last_command_time = {}   # gpu_idx -> time.monotonic() of that write
+last_written = {}        # gpu_idx -> last duty ACTUALLY written (hysteresis state)
 
 
 def dell_level(v):
@@ -385,6 +395,7 @@ def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
     if has_enable_interface(pwm_file):
         set_fan_speed(gpu_idx, pwm_file, pwm_value)
         last_command[gpu_idx] = pwm_value
+        last_written[gpu_idx] = pwm_value
         last_command_time[gpu_idx] = now
         return
 
@@ -394,6 +405,7 @@ def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
     if force or changed or stale:
         set_fan_speed(gpu_idx, pwm_file, pwm_value)
         last_command[gpu_idx] = pwm_value
+        last_written[gpu_idx] = pwm_value
         last_command_time[gpu_idx] = now
 
 
@@ -709,6 +721,17 @@ def main():
                             step = 0
 
                         smoothed_pwm = current_pwms[gpu_idx] + step
+
+                        # Dell level hysteresis: don't drop a level unless the
+                        # raw target is clearly past the boundary (see
+                        # LEVEL_HYST). Freezes the coast until release.
+                        is_dell = not has_enable_interface(FAN_MAP[gpu_idx])
+                        lw = last_written.get(gpu_idx)
+                        if (is_dell and lw is not None
+                                and dell_level(smoothed_pwm) < dell_level(lw)
+                                and target_pwm >= LEVEL_FLOOR[dell_level(lw)] - LEVEL_HYST):
+                            smoothed_pwm = LEVEL_FLOOR[dell_level(lw)]
+
                         current_pwms[gpu_idx] = smoothed_pwm
 
                         command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
