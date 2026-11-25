@@ -211,12 +211,10 @@ COOL_RECOVER_MARGIN = 12
 CPU_PRECRIT = 84              # °C — immediate (rate-limited) alert
 GPU_PRECRIT = 85
 
-# During a GPU cooling failure the fan is already maxed and the only lever
-# left is the heat source, so the card is power-capped; the previous limit
-# is remembered and restored on recovery. 0 = alert-only. The CPU is
-# deliberately NOT auto-throttled: trading serving performance away
-# automatically is the owner's call, not the fan daemon's.
-MITIGATE_GPU_POWER_LIMIT = 60  # W
+# Both channels are ALERT-ONLY: no auto-mitigation. The V100 self-throttles
+# at its 88 °C hardware-slowdown target before the stuck-hot floor can mean
+# damage, and the CPU self-throttles at Tjmax — the daemon's job ends at
+# telling the operator, not trading their performance away.
 
 # Email alerts are optional; without --alert-email (or with an unreadable
 # creds file) the daemon runs alert-less and every event still hits the
@@ -830,27 +828,7 @@ def send_alert(kind, subject, body):
 
 temp_hist = {}       # key -> list[(monotonic, temp_c)], pruned to ~6 min
 high_since = {}      # key -> monotonic since the channel entered HIGH
-cooling_fault = {}   # key -> dict(declared_at[, power_limit_restored])
-
-
-def gpu_set_power_limit(gpu_idx, watts=None):
-    """Query (watts=None) or set the card's power limit in W. Returns the
-    resulting limit as float, or None on failure."""
-    cmd = ["nvidia-smi", "-i", str(gpu_idx)]
-    if watts is None:
-        cmd += ["--query-gpu=power.limit", "--format=csv,noheader,nounits"]
-    else:
-        cmd += ["-pl", str(watts)]
-    try:
-        out = subprocess.check_output(cmd, encoding="utf-8", timeout=15)
-        if watts is None:
-            return float(out.strip().splitlines()[0])
-        logger.info("GPU %d: power limit set to %s W", gpu_idx, watts)
-        return float(watts)
-    except Exception as e:
-        logger.error("GPU %d power-limit %s failed: %s", gpu_idx,
-                     "query" if watts is None else f"set {watts}W", e)
-        return None
+cooling_fault = {}   # key -> dict(declared_at)
 
 
 def cooling_monitor(key, temp, commanded, debug=False):
@@ -883,17 +861,14 @@ def cooling_monitor(key, temp, commanded, debug=False):
 
     if key in cooling_fault:
         if temp <= floor - COOL_RECOVER_MARGIN:
-            fault = cooling_fault.pop(key)
+            cooling_fault.pop(key)
             high_since.pop(key, None)
-            note = ""
-            if "power_limit_restored" in fault:
-                note = f"\nGPU power limit restored to {fault['power_limit_restored']:.0f} W."
             logger.warning("Cooling recovered on %s (%d C)", label, temp)
             send_alert(
                 f"coolfail-{key}",
                 f"RECOVERED: {label} cooling back in range ({temp}C)",
                 f"{label} cooling-failure condition cleared at {temp}C "
-                f"(floor {floor}C minus margin {COOL_RECOVER_MARGIN}C).{note}")
+                f"(floor {floor}C minus margin {COOL_RECOVER_MARGIN}C).")
         return
 
     if not high:
@@ -930,13 +905,6 @@ def cooling_monitor(key, temp, commanded, debug=False):
             "Heat may not be leaving the system despite the fan spinning "
             "(mount/paste/flow failure), or the load exceeds the cooling "
             f"envelope. Check the machine. Telemetry: journalctl -u {SERVICE_NAME}")
-    if (not is_cpu) and MITIGATE_GPU_POWER_LIMIT:
-        orig = gpu_set_power_limit(key)
-        if gpu_set_power_limit(key, MITIGATE_GPU_POWER_LIMIT) is not None and orig is not None:
-            cooling_fault[key]["power_limit_restored"] = orig
-            body += (f"\nAuto-mitigation: GPU power limit lowered {orig:.0f} W"
-                     f" -> {MITIGATE_GPU_POWER_LIMIT} W; it will be restored "
-                     "automatically when cooling recovers.")
     send_alert(f"coolfail-{key}", f"COOLING FAILURE: {label} at {temp}C", body)
 
 
