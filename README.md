@@ -8,7 +8,7 @@ Reads GPU core + memory temperatures via `nvidia-smi` and writes PWM values to m
 
 - **Auto-detects GPUs** — queries `nvidia-smi` to find all GPUs on the system (1, 2, 3, 4, 5+)
 - **Auto-discovers hwmon path** — finds the fan chip's hwmon directory via glob, survives reboot renumbering
-- **Two hardware modes, auto-detected** — Super I/O (`pwmN_enable` files, re-enforced each cycle) or Dell SMM (no enable files; direct writes with per-cycle re-enforcement)
+- **Two hardware modes, auto-detected** — Super I/O (`pwmN_enable` files, re-enforced each cycle) or Dell SMM (no enable files; writes only on duty change plus a slow re-enforcement, because rapid EC writes stall the fan)
 - **User-defined fan mapping** — explicit GPU-to-PWM assignment via `GPU_TO_PWM` dict or `--gpu-map` (no guessing)
 - **PCI pinning** — `--gpu-pci 0=0000:03:00.0` refuses startup if an nvidia-smi index is not the physical card you expect, so GPU renumbering can never point a fan curve at the wrong card
 - **Linear temperature curve** — configurable min/max temperature and PWM thresholds
@@ -183,7 +183,7 @@ Three things differ from Super I/O boards and matter:
 
    If `pwm5` is missing, you need the 5-fan module — without it the PCIe header cannot be controlled from Linux at all.
 
-2. **Duty is quantized by the EC — and low duty stops the fan.** Writes 0–255 collapse into coarse levels; measured on the V100 PCIe blower (tach truth, not write-back):
+2. **Duty is quantized by the EC, writes are commands, and tach errors are not always "stopped".** Writes 0–255 collapse into coarse EC levels; measured on the V100 PCIe blower (tach truth, not write-back):
 
    | duty written | tach |
    |---|---|
@@ -191,11 +191,13 @@ Three things differ from Super I/O boards and matter:
    | 160 | ~1,240 RPM |
    | 128 | ~505 RPM |
    | 96 | ~132 RPM |
-   | ≤ 64 | **stopped** (tach read errors with `-EINVAL`) |
+   | below ~96 | slows under the tach's floor; reads fail with `-EINVAL` once below ~100 RPM (fan may still be turning) |
 
    Use `--pwm-min 160`. Do not trust `cat pwmN` read-back (it quantizes too); trust `fanN_input`.
 
-3. **The EC keeps its own policy and re-seeks duties** on all channels around your writes, so the daemon must stay running (that's the normal operating mode here, not a workaround). The BIOS fan-control sliders (F2 → Fan Control) set an EC floor under everything — keep a safe floor there so a dead daemon still means "moves air."
+3. **Rapid repeated writes stall the fan — write sparsely.** Each SMM duty write is an EC *command* with kick side-effects: a single write applies within a couple of seconds and holds, but writing the same value every second drove the blower down to a stop while writing. In Dell mode the script therefore only writes when the commanded duty **changes**, plus a re-enforcement write at most every `DELL_REENFORCE_S` (30 s) to out-rank EC policy drift. Super I/O behavior is unchanged.
+
+4. **The EC keeps its own policy** (thermal logic plus periodic fan-sniff excursions to full). The daemon stays running to correct drift and to react to GPU temperature, which the EC cannot see; the BIOS fan-control sliders (F2 → Fan Control) set an EC floor under everything — keep a safe floor there so a dead daemon still means "moves air."
 
 Channel map for the T5810 (per the 5-fan patch, verified by ear and tach):
 
@@ -264,7 +266,9 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_FILE` | `/var/log/v100-fan.log` | Log file path |
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
-| `TACH_ARM_DUTY` | 96 | Above this commanded duty, a failed tach read = stopped fan → force `PWM_MAX` |
+| `TACH_ARM_DUTY` | 96 | Above this commanded duty, tach failures count toward stall escalation |
+| `TACH_ERRORS_TO_ESCALATE` | 3 | Consecutive tach failures (armed) before forcing `PWM_MAX` |
+| `DELL_REENFORCE_S` | 30 | Dell SMM: seconds between same-value re-enforcement writes (value *changes* always write immediately) |
 | `FAILSAFE_TEMP_ERRORS` | 3 | Consecutive unreadable-temp cycles before forcing `PWM_MAX` on all mapped fans |
 | `RESTART_AFTER_TEMP_ERRORS` | 10 | Consecutive unreadable cycles before exiting nonzero for systemd restart |
 

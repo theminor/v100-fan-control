@@ -85,10 +85,21 @@ MAX_STEP_UP = 85    # Max PWM increase per tick (ramps up quickly for safety)
 MAX_STEP_DOWN = 4   # Max PWM decrease per tick (coasts down slowly to stop revving)
 
 # --- Stall / failure safety ---
-# Above this commanded duty a fan MUST be spinning: if its paired
-# fanN_input then errors (tach read fails = fan stopped on Dell SMM)
-# we force PWM_MAX. Below it, a missing tach is normal (fan parked).
+# Above this commanded duty a fan SHOULD be spinning measurably: if its
+# paired fanN_input then errors TACH_ERRORS_TO_ESCALATE cycles in a row we
+# force PWM_MAX. (Note: below ~100 RPM a tach physically cannot count and
+# reads error even though the fan spins — arming above TACH_ARM_DUTY and
+# requiring consecutive errors avoids false alarms from slow/coasting fans.)
 TACH_ARM_DUTY = 96
+TACH_ERRORS_TO_ESCALATE = 3
+# Dell SMM write policy: each SMM duty write is an EC command with kick
+# side-effects — measured on the T5810, rapidly repeated writes (1 Hz)
+# make the PCIe blower creep to a stop. So in Dell mode (auto-detected by
+# absence of pwmN_enable files) a value is only written when it CHANGES,
+# plus a re-enforcement re-write at most every DELL_REENFORCE_S seconds to
+# out-rank the EC's own policy drift. Super I/O keeps the original
+# write-every-cycle behavior (it needs it against *_enable reverts).
+DELL_REENFORCE_S = 30
 # If GPU temps have been unreadable this many cycles in a row, force
 # PWM_MAX on every mapped fan before trying anything else ("fail loud").
 FAILSAFE_TEMP_ERRORS = 3
@@ -320,9 +331,10 @@ def set_fan_speed(gpu_idx, pwm_file, pwm_value):
     On Super I/O chips we unconditionally re-enforce manual mode right
     before each write: the BIOS SMM can silently revert the *_enable flag
     without updating sysfs, so we re-lock it each cycle.
-    On Dell SMM there are no *_enable files at all — direct writes are
-    the only (and sufficient) interface; the EC's own policy re-seeks
-    around us, which the repeating loop out-runs.
+    On Dell SMM there are no *_enable files — direct writes are the only
+    interface, but they must be SPARSE (see DELL_REENFORCE_S comment:
+    rapid repeated writes stall the blower). Use command_fan() in the
+    loop, not this directly.
     """
     try:
         if has_enable_interface(pwm_file):
@@ -334,6 +346,34 @@ def set_fan_speed(gpu_idx, pwm_file, pwm_value):
             f.write(str(pwm_value))
     except Exception as e:
         logger.error("GPU %d: Error writing PWM to %s: %s", gpu_idx, pwm_file, e)
+
+
+# Dell-mode write pacing state
+last_command = {}        # gpu_idx -> last duty written
+last_command_time = {}   # gpu_idx -> time.monotonic() of that write
+
+
+def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
+    """Write-policy wrapper.
+
+    Super I/O: write every call (original tuned behavior; also re-locks
+    the enable flag). Dell SMM: write only when the commanded duty
+    changes, or when DELL_REENFORCE_S has elapsed since the last write —
+    never spam the EC. force=True (safety paths) always writes.
+    """
+    now = time.monotonic()
+    if has_enable_interface(pwm_file):
+        set_fan_speed(gpu_idx, pwm_file, pwm_value)
+        last_command[gpu_idx] = pwm_value
+        last_command_time[gpu_idx] = now
+        return
+
+    changed = pwm_value != last_command.get(gpu_idx)
+    stale = (now - last_command_time.get(gpu_idx, 0.0)) >= DELL_REENFORCE_S
+    if force or changed or stale:
+        set_fan_speed(gpu_idx, pwm_file, pwm_value)
+        last_command[gpu_idx] = pwm_value
+        last_command_time[gpu_idx] = now
 
 
 def tach_file_for(pwm_file):
@@ -608,7 +648,8 @@ def main():
     logger.info("Fan control loop started")
 
     consecutive_errors = 0
-    current_pwms = {}  # Tracks the actual running speed of each fan for smoothing
+    current_pwms = {}   # Tracks the actual running speed of each fan for smoothing
+    tach_errors = {}    # gpu_idx -> consecutive tach failures (Dell watchdog)
 
     try:
         while True:
@@ -639,24 +680,30 @@ def main():
                         smoothed_pwm = current_pwms[gpu_idx] + step
                         current_pwms[gpu_idx] = smoothed_pwm
 
-                        set_fan_speed(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
+                        command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
 
-                        # Stall watchdog: at a commanded duty that must spin
-                        # the fan, a failing tach read means stopped/no
-                        # pulses — force max cooling immediately.
+                        # Stall watchdog (debounced): at a commanded duty that
+                        # should spin the fan visibly, N consecutive tach
+                        # failures mean stopped/no pulses — force max cooling.
+                        # A single error is common while the EC transitions
+                        # between levels or below ~100 RPM.
                         tach = tach_file_for(FAN_MAP[gpu_idx])
                         if tach and smoothed_pwm >= TACH_ARM_DUTY:
                             rpm = read_tach(tach)
                             if rpm is None:
-                                logger.error(
-                                    "GPU %d: commanded PWM %d but tach read "
-                                    "failed — fan stopped? Forcing PWM %d",
-                                    gpu_idx, smoothed_pwm, PWM_MAX,
-                                )
-                                current_pwms[gpu_idx] = PWM_MAX
-                                set_fan_speed(gpu_idx, FAN_MAP[gpu_idx], PWM_MAX)
-                            elif args.debug:
-                                logger.info("GPU %d: tach=%d RPM", gpu_idx, rpm)
+                                tach_errors[gpu_idx] = tach_errors.get(gpu_idx, 0) + 1
+                                if tach_errors[gpu_idx] >= TACH_ERRORS_TO_ESCALATE:
+                                    logger.error(
+                                        "GPU %d: commanded PWM %d but %d tach "
+                                        "reads failed — fan stopped? Forcing PWM %d",
+                                        gpu_idx, smoothed_pwm, tach_errors[gpu_idx], PWM_MAX,
+                                    )
+                                    current_pwms[gpu_idx] = PWM_MAX
+                                    command_fan(gpu_idx, FAN_MAP[gpu_idx], PWM_MAX, force=True)
+                            else:
+                                tach_errors[gpu_idx] = 0
+                                if args.debug:
+                                    logger.info("GPU %d: tach=%d RPM", gpu_idx, rpm)
 
                         # Debug output so you can watch the smoothing in real-time
                         if args.debug and step != 0:
@@ -676,7 +723,7 @@ def main():
                     )
                     for gpu_idx, pwm_file in FAN_MAP.items():
                         current_pwms[gpu_idx] = PWM_MAX
-                        set_fan_speed(gpu_idx, pwm_file, PWM_MAX)
+                        command_fan(gpu_idx, pwm_file, PWM_MAX, force=True)
 
                 if consecutive_errors >= RESTART_AFTER_TEMP_ERRORS:
                     logger.error(
