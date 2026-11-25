@@ -173,7 +173,10 @@ GPU_TO_PWM = {
 CPU_TO_PWM = None             # pwm channel number for the CPU fan; None = off
 CPU_CHIP_NAME = "coretemp"    # hwmon chip carrying the CPU package temp
 CPU_T_HOT = 75                # °C — command HIGH at/above
-CPU_T_COOL = 68               # °C — drop to LOW at/below; between = hold
+CPU_T_COOL = 58               # °C — drop to LOW at/below; between = hold.
+                              # MUST sit below the full-load equilibrium at
+                              # HIGH fan (~62 on the T5810 @140W) or the
+                              # thermostat limit-cycles under sustained load.
 CPU_DUTY_LOW = 160            # ≈1,015 RPM on the T5810 CPU fan
 CPU_DUTY_HIGH = 224           # ≈4,300 RPM on the T5810 CPU fan
 CPU_BAND_LOW = (800, 1400)    # settled-RPM band checks for the CPU channel

@@ -237,7 +237,7 @@ WantedBy=multi-user.target
 
 ### CPU fan channel (`--cpu-pwm 1`)
 
-BIOS "Low" mode pins the CPU fan too (~1,030 RPM regardless of load) — a 30-minute all-core soak on the T5810 hit **95 °C with continuous throttling** at that pin. `--cpu-pwm 1` adds an independent two-level thermostat driven by coretemp: at/above `CPU_T_HOT` (default 75 °C) command HIGH, at/below `CPU_T_COOL` (68 °C) return to LOW, hold in between. Measured CPU-channel duty ladder on the T5810 is **binary**: ≤160 → ≈1,015 RPM, ≥192 → ≈4,300 RPM (no usable middle). Ladders are fan- and board-specific — measure before choosing duties on any other machine; the same write-on-change, kick-grace, and tach-deviation discipline applies.
+BIOS "Low" mode pins the CPU fan too (~1,030 RPM regardless of load) — a 30-minute all-core soak on the T5810 hit **95 °C with continuous throttling** at that pin. `--cpu-pwm 1` adds an independent two-level thermostat driven by coretemp: at/above `CPU_T_HOT` (75 °C) command HIGH, at/below `CPU_T_COOL` (58 °C) return to LOW, hold in between. `CPU_T_COOL` **must be below the full-load equilibrium temperature at HIGH fan** (~62 °C on this box at 140 W) — with the drop threshold at 68 the thermostat revved on a ~60 s cycle under sustained load. Measured CPU-channel duty ladder on the T5810 is **binary**: ≤160 → ≈1,015 RPM, ≥192 → ≈4,300 RPM (no usable middle). Ladders are fan- and board-specific — measure before choosing duties on any other machine; the same write-on-change, kick-grace, and tach-deviation discipline applies.
 
 ## Command-Line Options
 
@@ -271,7 +271,7 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_FILE` | `/var/log/v100-fan.log` | Log file path |
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
-| `CPU_T_HOT` / `CPU_T_COOL` | 75 / 68 | With `--cpu-pwm`: °C thresholds for the two-level CPU thermostat (hold between) |
+| `CPU_T_HOT` / `CPU_T_COOL` | 75 / 58 | With `--cpu-pwm`: °C thresholds for the two-level CPU thermostat (hold between) |
 | `CPU_DUTY_LOW` / `CPU_DUTY_HIGH` | 160 / 224 | CPU channel duties (T5810-measured ladder: ≈1,015 / ≈4,300 RPM) |
 | `DELL_T_HOT` | 50 | Dell mode: °C at/above which the blower is commanded full |
 | `DELL_T_COOL` | 44 | Dell mode: °C at/below which the blower is commanded low; between = hold |
