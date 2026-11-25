@@ -185,19 +185,19 @@ Three things differ from Super I/O boards and matter:
 
 2. **Duty is quantized by the EC, writes are commands, and tach errors are not always "stopped".** Writes 0–255 collapse into coarse EC levels; measured on the V100 PCIe blower (tach truth, not write-back):
 
-   | duty written | tach |
+   | duty written | settled tach (BIOS mode = Low) |
    |---|---|
-   | 255 | ~4,000 RPM |
-   | 160 | ~1,240 RPM |
-   | 128 | ~505 RPM |
-   | 96 | ~132 RPM |
-   | below ~96 | slows under the tach's floor; reads fail with `-EINVAL` once below ~100 RPM (fan may still be turning) |
+   | ≥ 192 | ~4,100 RPM |
+   | 112–191 | ~505 RPM |
+   | < 112 | ~130 RPM or below the tach's readable floor (reads fail with `-EINVAL`; fan may still turn) |
 
    Use `--pwm-min 160`. Do not trust `cat pwmN` read-back (it quantizes too); trust `fanN_input`.
 
-3. **Rapid repeated writes stall the fan — write sparsely.** Each SMM duty write is an EC *command* with kick side-effects: a single write applies within a couple of seconds and holds, but writing the same value every second drove the blower down to a stop while writing. In Dell mode the script therefore only writes when the commanded duty **changes**, plus a re-enforcement write at most every `DELL_REENFORCE_S` (30 s) to out-rank EC policy drift. Super I/O behavior is unchanged.
+3. **BIOS Fan Control mode must be "Low".** With BIOS mode "Auto" the EC reclaims the channel seconds after any write (observed sawtooth 1,300→~170 RPM on a 30 s cycle) and ignores sustained control; "Low" mode holds our commanded level indefinitely. There is no Linux-side way to disable the EC's auto policy on this platform (no `pwmN_enable` interface), so this is a **deployment prerequisite**, not a preference.
 
-4. **The EC keeps its own policy** (thermal logic plus periodic fan-sniff excursions to full). The daemon stays running to correct drift and to react to GPU temperature, which the EC cannot see; the BIOS fan-control sliders (F2 → Fan Control) set an EC floor under everything — keep a safe floor there so a dead daemon still means "moves air."
+4. **Rapid repeated writes stall the fan — write only on change.** Each SMM duty write is an EC *command* with a ~10–25 s kick/transition; writing the same value every second drove the blower to a stop. In Dell mode the script therefore writes only when the commanded duty **changes**, judges tach only after a `DELL_KICK_GRACE_S` grace window, and re-issues a command solely when settled tach sits outside the expected band (`TACH_BANDS`) for `TACH_DEV_SAMPLES` reads. Super I/O behavior is unchanged.
+
+5. **The EC keeps its own policy** (in Low mode, a fixed baseline; the earlier "sniff" excursions belong to Auto). The daemon reacts to GPU temperature, which the EC cannot see.
 
 Channel map for the T5810 (per the 5-fan patch, verified by ear and tach):
 

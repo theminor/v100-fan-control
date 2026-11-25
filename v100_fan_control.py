@@ -92,14 +92,26 @@ MAX_STEP_DOWN = 4   # Max PWM decrease per tick (coasts down slowly to stop revv
 # requiring consecutive errors avoids false alarms from slow/coasting fans.)
 TACH_ARM_DUTY = 96
 TACH_ERRORS_TO_ESCALATE = 3
-# Dell SMM write policy: each SMM duty write is an EC command with kick
-# side-effects — measured on the T5810, rapidly repeated writes (1 Hz)
-# make the PCIe blower creep to a stop. So in Dell mode (auto-detected by
-# absence of pwmN_enable files) a value is only written when it CHANGES,
-# plus a re-enforcement re-write at most every DELL_REENFORCE_S seconds to
-# out-rank the EC's own policy drift. Super I/O keeps the original
-# write-every-cycle behavior (it needs it against *_enable reverts).
-DELL_REENFORCE_S = 30
+# --- Dell SMM write policy (T5810 findings, 2026-11-25) ---
+# Each SMM duty write is an EC COMMAND producing a ~10-25 s kick/transition;
+# the resulting level then HOLDS indefinitely — PROVIDED the BIOS Fan Control
+# mode is "Low". In BIOS "Auto" mode the EC reclaims the channel within
+# seconds of any write (sawtooth), and rapid repeated writes creep the fan
+# toward a stop. Therefore in Dell mode:
+#   - write ONLY when the commanded duty changes (no periodic refresh;
+#     DELL_REENFORCE_S is a safety ceiling for exotic drift cases only),
+#   - a re-enforcement write may also be issued when the SETTLED tach
+#     disagrees with the commanded level band for TACH_DEV_SAMPLES reads.
+DELL_REENFORCE_S = 3600     # hard ceiling for same-value re-writes
+DELL_KICK_GRACE_S = 25      # after any write, tach is transitioning: don't judge
+TACH_DEV_SAMPLES = 3        # consecutive out-of-band settled reads -> re-issue
+# Settled RPM bands by commanded duty (T5810 PCIe blower, Low mode; the EC
+# quantizes: canonical levels ~<112 → ≈130 RPM (often below the tach's
+# readable floor), 112–191 → ≈505 RPM, ≥192 → ≈4100 RPM):
+TACH_BANDS = (
+    (192, 2300, 6200),
+    (112, 280, 760),
+)
 # If GPU temps have been unreadable this many cycles in a row, force
 # PWM_MAX on every mapped fan before trying anything else ("fail loud").
 FAILSAFE_TEMP_ERRORS = 3
@@ -376,6 +388,15 @@ def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
         last_command_time[gpu_idx] = now
 
 
+def expected_band(cmd_pwm):
+    """Settled-RPM band (lo, hi) for a commanded duty, or None when the
+    expected level is too slow for the tach to be a reliable judge."""
+    for threshold, lo, hi in TACH_BANDS:
+        if cmd_pwm >= threshold:
+            return (lo, hi)
+    return None
+
+
 def tach_file_for(pwm_file):
     """The fanN_input paired with pwmN, or None if the chip lacks it."""
     name = os.path.basename(pwm_file)          # e.g. pwm5
@@ -650,6 +671,7 @@ def main():
     consecutive_errors = 0
     current_pwms = {}   # Tracks the actual running speed of each fan for smoothing
     tach_errors = {}    # gpu_idx -> consecutive tach failures (Dell watchdog)
+    tach_dev = {}       # gpu_idx -> consecutive out-of-band settled reads
 
     try:
         while True:
@@ -682,28 +704,43 @@ def main():
 
                         command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
 
-                        # Stall watchdog (debounced): at a commanded duty that
-                        # should spin the fan visibly, N consecutive tach
-                        # failures mean stopped/no pulses — force max cooling.
-                        # A single error is common while the EC transitions
-                        # between levels or below ~100 RPM.
+                        # Tach feedback. Grace period first: right after any
+                        # write the EC is mid-transition and tach reads are
+                        # unreliable (they can even error briefly).
+                        #   armed + errors  -> stalled fan -> force PWM_MAX
+                        #   settled out-of-band -> re-issue same command once
                         tach = tach_file_for(FAN_MAP[gpu_idx])
                         if tach and smoothed_pwm >= TACH_ARM_DUTY:
+                            in_grace = (time.monotonic() - last_command_time.get(gpu_idx, 0.0)) < DELL_KICK_GRACE_S
                             rpm = read_tach(tach)
                             if rpm is None:
-                                tach_errors[gpu_idx] = tach_errors.get(gpu_idx, 0) + 1
-                                if tach_errors[gpu_idx] >= TACH_ERRORS_TO_ESCALATE:
-                                    logger.error(
-                                        "GPU %d: commanded PWM %d but %d tach "
-                                        "reads failed — fan stopped? Forcing PWM %d",
-                                        gpu_idx, smoothed_pwm, tach_errors[gpu_idx], PWM_MAX,
-                                    )
-                                    current_pwms[gpu_idx] = PWM_MAX
-                                    command_fan(gpu_idx, FAN_MAP[gpu_idx], PWM_MAX, force=True)
+                                if not in_grace:
+                                    tach_errors[gpu_idx] = tach_errors.get(gpu_idx, 0) + 1
+                                    if tach_errors[gpu_idx] >= TACH_ERRORS_TO_ESCALATE:
+                                        logger.error(
+                                            "GPU %d: commanded PWM %d but %d tach "
+                                            "reads failed — fan stopped? Forcing PWM %d",
+                                            gpu_idx, smoothed_pwm, tach_errors[gpu_idx], PWM_MAX,
+                                        )
+                                        current_pwms[gpu_idx] = PWM_MAX
+                                        command_fan(gpu_idx, FAN_MAP[gpu_idx], PWM_MAX, force=True)
                             else:
                                 tach_errors[gpu_idx] = 0
+                                band = expected_band(smoothed_pwm)
+                                if not in_grace and band and not (band[0] <= rpm <= band[1]):
+                                    tach_dev[gpu_idx] = tach_dev.get(gpu_idx, 0) + 1
+                                    if tach_dev[gpu_idx] >= TACH_DEV_SAMPLES:
+                                        logger.warning(
+                                            "GPU %d: settled tach %d RPM outside band %s "
+                                            "for commanded duty %d — re-issuing command",
+                                            gpu_idx, rpm, band, smoothed_pwm,
+                                        )
+                                        command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm, force=True)
+                                        tach_dev[gpu_idx] = 0
+                                else:
+                                    tach_dev[gpu_idx] = 0
                                 if args.debug:
-                                    logger.info("GPU %d: tach=%d RPM", gpu_idx, rpm)
+                                    logger.info("GPU %d: tach=%d RPM%s", gpu_idx, rpm, " (grace)" if in_grace else "")
 
                         # Debug output so you can watch the smoothing in real-time
                         if args.debug and step != 0:
