@@ -2,25 +2,30 @@
 
 Automatic PWM fan curve control for NVIDIA GPUs on Linux.
 
-Reads GPU core + memory temperatures via `nvidia-smi` and writes PWM values to motherboard fan headers via the Super I/O hardware monitor driver (it87, nct6775, or compatible). Each GPU's blower fan is independently controlled.
+Reads GPU core + memory temperatures via `nvidia-smi` and writes PWM values to motherboard fan headers via the `hwmon` subsystem — either a Super I/O driver (it87, nct6775, or compatible) or the Dell EC driver (`dell_smm`). Each GPU's blower fan is independently controlled.
 
 ## Features
 
 - **Auto-detects GPUs** — queries `nvidia-smi` to find all GPUs on the system (1, 2, 3, 4, 5+)
-- **Auto-discovers hwmon path** — finds the Super I/O hwmon directory via glob, survives reboot renumbering
-- **User-defined fan mapping** — explicit GPU-to-PWM assignment via `GPU_TO_PWM` dict (no guessing)
+- **Auto-discovers hwmon path** — finds the fan chip's hwmon directory via glob, survives reboot renumbering
+- **Two hardware modes, auto-detected** — Super I/O (`pwmN_enable` files, re-enforced each cycle) or Dell SMM (no enable files; direct writes with per-cycle re-enforcement)
+- **User-defined fan mapping** — explicit GPU-to-PWM assignment via `GPU_TO_PWM` dict or `--gpu-map` (no guessing)
+- **PCI pinning** — `--gpu-pci 0=0000:03:00.0` refuses startup if an nvidia-smi index is not the physical card you expect, so GPU renumbering can never point a fan curve at the wrong card
 - **Linear temperature curve** — configurable min/max temperature and PWM thresholds
-- **Memory temp monitoring** — uses the hotter of core or memory temp (HBM memory often runs hotter than the core)
+- **Memory temp monitoring** — uses the hotter of core or memory temp (HBM memory often runs hotter than the core); tolerates `[N/A]` readings on cards that don't report memory temp
 - **Acoustic smoothing** — limits PWM step size per cycle to prevent audible fan "revving" (ramps up fast for safety, coasts down slowly)
+- **Tach stall watchdog** — if a commanded duty above `TACH_ARM_DUTY` pairs with a failed tach read (fan stopped), forces `PWM_MAX` immediately
+- **Fail-loud telemetry loss** — forces `PWM_MAX` on all mapped fans when GPU temps become unreadable, then restarts the service to clear driver state
 - **Graceful shutdown** — restores BIOS fan control on SIGINT/SIGTERM
-- **BIOS override enforcement** — re-enforces manual mode each cycle to counter BIOS SMM reversion
-- **Error recovery** — auto-restarts after 10 consecutive nvidia-smi failures to clear NVML driver state
+- **Error recovery** — auto-restarts after repeated nvidia-smi failures to clear NVML driver state
 - **Rotating log files** — 5 MB max, 3 backups
 
 ## Hardware Requirements
 
 - NVIDIA GPU(s) with nvidia-smi available
-- Motherboard with Super I/O chip supporting PWM fan headers (it87, it8620e, nct6775, or compatible)
+- Motherboard fan control exposed via `hwmon`:
+  - Super I/O chip with PWM fan headers (it87, it8620e, nct6775, or compatible), **or**
+  - Dell EC via `dell_smm` (see [Dell SMM mode](#dell-smm-mode-dell-precision-t5810))
 - Linux kernel with the appropriate `hwmon` driver loaded
 - Root privileges (the script writes directly to `/sys/class/hwmon/`)
 
@@ -164,6 +169,84 @@ The script validates that:
 
 The hwmon path and available PWM channels are **auto-discovered** — you only need to specify the GPU-to-PWM mapping.
 
+## Dell SMM mode (Dell Precision T5810)
+
+Dell desktops have no Super I/O fan chip the OS can touch: fan control lives in the EC and is reached through the `dell_smm` hwmon driver via SMM BIOS calls. The script auto-detects this (no `pwmN_enable` files) and switches behavior: direct PWM writes, re-enforced every poll cycle.
+
+Three things differ from Super I/O boards and matter:
+
+1. **The stock kernel hides the 5th fan channel.** `DELL_SMM_NO_FANS` is 4, so the SYS_FAN3 "PCIe Fan" header does not exist in Linux. An upstream patch ([PATCH] hwmon: (dell-smm) Extend fan support to 5 fans) raises the limit to 5; on our T5810 it is installed as a DKMS module (`dell-smm-hwmon-5fan`). Verify before use:
+
+   ```bash
+   ls /sys/devices/platform/dell_smm_hwmon/hwmon/hwmon*/pwm5
+   ```
+
+   If `pwm5` is missing, you need the 5-fan module — without it the PCIe header cannot be controlled from Linux at all.
+
+2. **Duty is quantized by the EC — and low duty stops the fan.** Writes 0–255 collapse into coarse levels; measured on the V100 PCIe blower (tach truth, not write-back):
+
+   | duty written | tach |
+   |---|---|
+   | 255 | ~4,000 RPM |
+   | 160 | ~1,240 RPM |
+   | 128 | ~505 RPM |
+   | 96 | ~132 RPM |
+   | ≤ 64 | **stopped** (tach read errors with `-EINVAL`) |
+
+   Use `--pwm-min 160`. Do not trust `cat pwmN` read-back (it quantizes too); trust `fanN_input`.
+
+3. **The EC keeps its own policy and re-seeks duties** on all channels around your writes, so the daemon must stay running (that's the normal operating mode here, not a workaround). The BIOS fan-control sliders (F2 → Fan Control) set an EC floor under everything — keep a safe floor there so a dead daemon still means "moves air."
+
+Channel map for the T5810 (per the 5-fan patch, verified by ear and tach):
+
+| channel | header | physical |
+|---|---|---|
+| pwm1 | CPU_FAN | CPU heatsink |
+| pwm2 | — | second-CPU phantom on single-socket boards (always 0) |
+| pwm3 | SYS_FAN1 (top) | Right DIMM bank fan |
+| pwm4 | SYS_FAN2 (middle) | Left DIMM bank fan |
+| pwm5 | SYS_FAN3 (bottom) | **PCIe Fan** — where a modded PCIe V100 blower goes |
+
+T5810 example (our AI rig — PCIe V100 at nvidia-smi index 0, bus 03:00.0, blower on SYS_FAN3):
+
+```bash
+sudo python3 v100_fan_control.py --debug \
+    --hwmon-device dell_smm_hwmon \
+    --gpu-map "0:5" \
+    --gpu-pci 0=0000:03:00.0 \
+    --pwm-min 160
+```
+
+And as a service (`/etc/systemd/system/v100-fan-control.service`):
+
+```ini
+[Unit]
+Description=V100 PCIe blower fan control (Dell SMM pwm5)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/john/v100-fan-control/v100_fan_control.py --hwmon-device dell_smm_hwmon --gpu-map 0:5 --gpu-pci 0=0000:03:00.0 --pwm-min 160
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Command-Line Options
+
+CLI flags override the corresponding `SETTINGS` constants, so one script copy serves multiple machines:
+
+| Flag | Overrides | Example |
+|---|---|---|
+| `--hwmon-device NAME` | `HWMON_DEVICE` | `dell_smm_hwmon` |
+| `--gpu-map GPU:PWM[,...]` | `GPU_TO_PWM` | `"0:5"` or `"0:2,1:1"` |
+| `--gpu-pci GPU=PCI` | (new check) | `0=0000:03:00.0`, repeatable; startup fails on mismatch |
+| `--pwm-min N` | `PWM_MIN` | `160` on Dell SMM / V100 blower |
+| `--pwm-max N` | `PWM_MAX` | `255` |
+| `--poll-interval S` | `POLL_INTERVAL` | `3` |
+| `--debug` | — | verbose logging every cycle |
+
 ## Settings Reference
 
 All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` section:
@@ -181,6 +264,9 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_FILE` | `/var/log/v100-fan.log` | Log file path |
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
+| `TACH_ARM_DUTY` | 96 | Above this commanded duty, a failed tach read = stopped fan → force `PWM_MAX` |
+| `FAILSAFE_TEMP_ERRORS` | 3 | Consecutive unreadable-temp cycles before forcing `PWM_MAX` on all mapped fans |
+| `RESTART_AFTER_TEMP_ERRORS` | 10 | Consecutive unreadable cycles before exiting nonzero for systemd restart |
 
 ## Troubleshooting
 
@@ -190,6 +276,9 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 - **Fans not responding** — The BIOS may have reverted the `*_enable` flag. The script re-enforces it each cycle, but you may also need to disable "Q-Fan Control" or "Hardware Monitor" in the BIOS.
 - **Fans revving up and down** — Increase `MAX_STEP_DOWN` or increase `POLL_INTERVAL` to give fans more time to settle between commands.
 - **Fewer PWM channels than GPUs** — The script will skip unassigned GPUs. Consider a PCIe fan controller or a motherboard with more headers.
+- **Dell: `pwm5` missing** — stock kernel's `dell_smm` only creates 4 fan channels; install the 5-fan `dell-smm-hwmon` DKMS module (see Dell SMM mode above).
+- **Dell: duty read-back doesn't match what you wrote** — normal; the EC quantizes. Watch `fanN_input` RPM instead.
+- **Dell: fan stopped after writing low values** — duties ≤ 64 stall the blower on the PCIe channel; keep `--pwm-min 160`.
 
 ## License
 
