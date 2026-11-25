@@ -191,21 +191,18 @@ import socket
 SERVICE_NAME = "v100-fan-control"
 HOSTNAME = socket.gethostname().split(".")[0]
 
-# The tach can prove a fan SPINS; it cannot prove heat is LEAVING. A
-# channel is declared in COOLING FAILURE when it has been commanded to its
-# HIGH level for COOL_FAIL_WINDOW_S and the temperature is either still
-# RISING (>= COOL_RISE_WARN_C_PER_MIN over the recent ~90 s trend) at/above
-# the COOL_*_FLOOR, or STUCK HOT (>= COOL_*_STUCK for COOL_FAIL_STUCK_S —
-# flat-but-hot at maximum cooling is exactly as failed as rising). Cleared
-# when the temp falls COOL_RECOVER_MARGIN below the floor; recovery is
-# announced. Thresholds assume this box's measured equilibria (CPU ~66°C
-# at HIGH+140W; blower ~48°C at full+100W) — re-check after hardware moves.
-COOL_FAIL_WINDOW_S = 60
+# The tach can prove a fan SPINS; it cannot prove heat is LEAVING. But a
+# RISING temperature at full fan is NORMAL behaviour while load ramps and
+# must never alert (per John 2026-11-25 — Inkling prefill walks the blower
+# card up and plateaus, that is the system working). The abnormal signature
+# is the PLATEAU itself: temperature at/above COOL_*_STUCK while commanded
+# to maximum cooling for COOL_FAIL_STUCK_S straight. Cleared below stuck
+# minus margin; recovery is announced. Stuck thresholds sit well above this
+# box's measured equilibria (CPU ~66°C at HIGH+140W; blower card ~70°C at
+# full+200W) and just under the hardware self-throttle points (CPU Tjmax 85;
+# V100 HW slowdown 88) — re-check after hardware moves.
 COOL_FAIL_STUCK_S = 300
-COOL_RISE_WARN_C_PER_MIN = 0.3
-CPU_COOL_FLOOR = 70
 CPU_COOL_STUCK = 80
-GPU_COOL_FLOOR = 65
 GPU_COOL_STUCK = 80
 COOL_RECOVER_MARGIN = 12
 CPU_PRECRIT = 84              # °C — immediate (rate-limited) alert
@@ -826,7 +823,6 @@ def send_alert(kind, subject, body):
 #  Cooling-effectiveness watchdog
 # ---------------------------------------------------------------------------
 
-temp_hist = {}       # key -> list[(monotonic, temp_c)], pruned to ~6 min
 high_since = {}      # key -> monotonic since the channel entered HIGH
 cooling_fault = {}   # key -> dict(declared_at)
 
@@ -835,20 +831,15 @@ def cooling_monitor(key, temp, commanded, debug=False):
     """Per-cycle cooling-effectiveness check for one channel.
 
     Fan-stopping is the tach watchdog's job; this catches the failure the
-    tach CANNOT see: air moving at maximum while heat stops leaving. See
-    the constants block for the rule and its thresholds."""
+    tach CANNOT see: air moving at maximum while heat stops leaving. Only
+    the PLATEAU counts — a temperature rising under ramping load is normal
+    and never alerts. See the constants block for thresholds."""
     now = time.monotonic()
     is_cpu = key == CPU_KEY
-    floor = CPU_COOL_FLOOR if is_cpu else GPU_COOL_FLOOR
     stuck = CPU_COOL_STUCK if is_cpu else GPU_COOL_STUCK
     precrit = CPU_PRECRIT if is_cpu else GPU_PRECRIT
     high_value = CPU_DUTY_HIGH if is_cpu else PWM_MAX
     label = "CPU" if is_cpu else f"GPU {key}"
-
-    hist = temp_hist.setdefault(key, [])
-    hist.append((now, temp))
-    while hist and hist[0][0] < now - 360:
-        hist.pop(0)
 
     if temp >= precrit:
         send_alert(
@@ -860,7 +851,7 @@ def cooling_monitor(key, temp, commanded, debug=False):
     high = commanded >= high_value
 
     if key in cooling_fault:
-        if temp <= floor - COOL_RECOVER_MARGIN:
+        if temp <= stuck - COOL_RECOVER_MARGIN:
             cooling_fault.pop(key)
             high_since.pop(key, None)
             logger.warning("Cooling recovered on %s (%d C)", label, temp)
@@ -868,7 +859,7 @@ def cooling_monitor(key, temp, commanded, debug=False):
                 f"coolfail-{key}",
                 f"RECOVERED: {label} cooling back in range ({temp}C)",
                 f"{label} cooling-failure condition cleared at {temp}C "
-                f"(floor {floor}C minus margin {COOL_RECOVER_MARGIN}C).")
+                f"(stuck floor {stuck}C minus margin {COOL_RECOVER_MARGIN}C).")
         return
 
     if not high:
@@ -876,35 +867,18 @@ def cooling_monitor(key, temp, commanded, debug=False):
         return
 
     t_high = high_since.setdefault(key, now)
-    if now - t_high < COOL_FAIL_WINDOW_S:
+    if temp < stuck or (now - t_high) < COOL_FAIL_STUCK_S:
         return
 
-    # Slope (C/min) over the most recent <=90 s of history. Requiring a
-    # span >=30 s avoids dividing by a nearly-empty window.
-    t_ref, ref = hist[0]
-    for h, v in reversed(hist):
-        if now - h <= 90:
-            t_ref, ref = h, v
-        else:
-            break
-    span = now - t_ref
-    slope = ((temp - ref) / span * 60) if span >= 30 else 0.0
-
-    rising = temp >= floor and slope >= COOL_RISE_WARN_C_PER_MIN
-    stuck_hot = temp >= stuck and (now - t_high) >= COOL_FAIL_STUCK_S
-    if not (rising or stuck_hot):
-        return
-
-    why = (f"temperature RISING {slope:.1f} C/min at {temp}C" if rising
-           else f"stuck at {temp}C for {(now - t_high) / 60:.0f} min")
+    why = f"plateaued at {temp}C for {(now - t_high) / 60:.0f} min at maximum fan duty"
     cooling_fault[key] = {"declared_at": now}
     logger.critical("COOLING FAILURE on %s: fan at max duty %d but %s",
                     label, commanded, why)
-    body = (f"{label}: commanded to maximum fan duty ({commanded}) but {why} "
-            f"(rising-floor {floor}C, stuck-floor {stuck}C).\n"
-            "Heat may not be leaving the system despite the fan spinning "
-            "(mount/paste/flow failure), or the load exceeds the cooling "
-            f"envelope. Check the machine. Telemetry: journalctl -u {SERVICE_NAME}")
+    body = (f"{label}: {why} (stuck floor {stuck}C).\n"
+            "Either the workload exceeds the cooling envelope or heat "
+            "transfer degraded (mount/paste/flow). The chip's own throttling "
+            "is the backstop; this alert means it is working hard to stay "
+            f"within limits. Check the machine. Telemetry: journalctl -u {SERVICE_NAME}")
     send_alert(f"coolfail-{key}", f"COOLING FAILURE: {label} at {temp}C", body)
 
 

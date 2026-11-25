@@ -241,7 +241,7 @@ BIOS "Low" mode pins the CPU fan too (~1,030 RPM regardless of load) — a 30-mi
 
 ### Cooling-effectiveness watchdog + email alerts
 
-The tach proves a fan *spins*; it cannot prove heat is *leaving*. So each controlled channel also runs a thermal-effectiveness check: commanded at maximum for 60 s while the temperature is **still rising** (>0.3 °C/min over the recent ~90 s) above a floor (CPU 70 / GPU 65 °C), **or stuck** at/above 80 °C for 5 minutes → a cooling failure is declared (journal `CRITICAL` + email). This is the signature of a loose heatsink, failed paste, blocked flow — or a load beyond the cooling envelope. Recovery (temp 12 °C below the floor) is announced too.
+The tach proves a fan *spins*; it cannot prove heat is *leaving*. But a *rising* temperature at full fan is simply what load ramps look like, and it never alerts (measured example: an Inkling 200 W prefill walks the blower card 50→70 °C and plateaus — normal, silent). The abnormal signature is the **plateau itself**: temperature at/above 80 °C while commanded to maximum cooling for 5 straight minutes → a cooling failure is declared (journal `CRITICAL` + email). 80 sits ~10 °C above this box's measured load equilibria (CPU 66 at 140 W, blower card 70 at 200 W) and just under the chips' self-throttle points (Tjmax 85 / HW slowdown 88), so the alert means "the envelope has genuinely shifted," not "work is happening." Recovery (temp ≤68 °C) is announced too.
 
 Alerts only — no auto-mitigation on either channel. The V100 self-throttles at its 88 °C hardware-slowdown target before the stuck-hot floor can mean damage, and the CPU self-throttles at Tjmax; the daemon's job ends at telling the operator, not trading their performance away.
 
