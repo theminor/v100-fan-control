@@ -365,11 +365,19 @@ last_command = {}        # gpu_idx -> last duty written
 last_command_time = {}   # gpu_idx -> time.monotonic() of that write
 
 
+def dell_level(v):
+    """Canonical EC level a duty command snaps to (T5810 Low mode): the EC
+    only distinguishes <112 (≈130 RPM), 112-191 (≈505), ≥192 (≈4100), so
+    writes within one band are pure kick side-effects with no physical
+    effect. Dell-mode change detection compares LEVELS, not raw duty."""
+    return 0 if v < 112 else (1 if v < 192 else 2)
+
+
 def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
     """Write-policy wrapper.
 
     Super I/O: write every call (original tuned behavior; also re-locks
-    the enable flag). Dell SMM: write only when the commanded duty
+    the enable flag). Dell SMM: write only when the commanded EC LEVEL
     changes, or when DELL_REENFORCE_S has elapsed since the last write —
     never spam the EC. force=True (safety paths) always writes.
     """
@@ -380,7 +388,8 @@ def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
         last_command_time[gpu_idx] = now
         return
 
-    changed = pwm_value != last_command.get(gpu_idx)
+    prev = last_command.get(gpu_idx)
+    changed = prev is None or dell_level(pwm_value) != dell_level(prev)
     stale = (now - last_command_time.get(gpu_idx, 0.0)) >= DELL_REENFORCE_S
     if force or changed or stale:
         set_fan_speed(gpu_idx, pwm_file, pwm_value)
