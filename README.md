@@ -239,6 +239,14 @@ WantedBy=multi-user.target
 
 BIOS "Low" mode pins the CPU fan too (~1,030 RPM regardless of load) — a 30-minute all-core soak on the T5810 hit **95 °C with continuous throttling** at that pin. `--cpu-pwm 1` adds an independent two-level thermostat driven by coretemp: at/above `CPU_T_HOT` (75 °C) command HIGH, at/below `CPU_T_COOL` (58 °C) return to LOW, hold in between. `CPU_T_COOL` **must be below the full-load equilibrium temperature at HIGH fan** (~62 °C on this box at 140 W) — with the drop threshold at 68 the thermostat revved on a ~60 s cycle under sustained load. Measured CPU-channel duty ladder on the T5810 is **binary**: ≤160 → ≈1,015 RPM, ≥192 → ≈4,300 RPM (no usable middle). Ladders are fan- and board-specific — measure before choosing duties on any other machine; the same write-on-change, kick-grace, and tach-deviation discipline applies.
 
+### Cooling-effectiveness watchdog + email alerts
+
+The tach proves a fan *spins*; it cannot prove heat is *leaving*. So each controlled channel also runs a thermal-effectiveness check: commanded at maximum for 60 s while the temperature is **still rising** (>0.3 °C/min over the recent ~90 s) above a floor (CPU 70 / GPU 65 °C), **or stuck** at/above 80 °C for 5 minutes → a cooling failure is declared (journal `CRITICAL` + email). This is the signature of a loose heatsink, failed paste, blocked flow — or a load beyond the cooling envelope. Recovery (temp 12 °C below the floor) is announced too.
+
+On a GPU failure the daemon additionally power-caps the card (`MITIGATE_GPU_POWER_LIMIT`, default 60 W; previous limit restored on recovery), because the fan is already maxed and heat *source* is the only remaining lever. The CPU is deliberately never auto-throttled — that trade belongs to the operator.
+
+**Email** is opt-in: `--alert-email ADDR` plus a root-owned, chmod-600 file (default `/etc/v100-fan-control/smtp_password`) holding the Gmail app password for `theminor.claw@gmail.com`. Alert classes: `coolfail-*` (declaration + recovery), `stall-*` (tach watchdog escalation), `precrit-*` (CPU ≥84 / GPU ≥85 °C), `loss-gpu` / `loss-cpu` (telemetry failsafe). Each is rate-limited to one message per 30 minutes; send failures never affect fan control. Verify the path end-to-end with `sudo python3 v100_fan_control.py --alert-email you@x --test-email` (sends one message and exits).
+
 ## Command-Line Options
 
 CLI flags override the corresponding `SETTINGS` constants, so one script copy serves multiple machines:

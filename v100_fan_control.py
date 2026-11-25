@@ -182,6 +182,52 @@ CPU_DUTY_HIGH = 224           # ≈4,300 RPM on the T5810 CPU fan
 CPU_BAND_LOW = (800, 1400)    # settled-RPM band checks for the CPU channel
 CPU_BAND_HIGH = (3600, 5200)
 
+# ============================================================
+#  COOLING-EFFECTIVENESS WATCHDOG + EMAIL ALERTS
+# ============================================================
+
+import socket
+
+SERVICE_NAME = "v100-fan-control"
+HOSTNAME = socket.gethostname().split(".")[0]
+
+# The tach can prove a fan SPINS; it cannot prove heat is LEAVING. A
+# channel is declared in COOLING FAILURE when it has been commanded to its
+# HIGH level for COOL_FAIL_WINDOW_S and the temperature is either still
+# RISING (>= COOL_RISE_WARN_C_PER_MIN over the recent ~90 s trend) at/above
+# the COOL_*_FLOOR, or STUCK HOT (>= COOL_*_STUCK for COOL_FAIL_STUCK_S —
+# flat-but-hot at maximum cooling is exactly as failed as rising). Cleared
+# when the temp falls COOL_RECOVER_MARGIN below the floor; recovery is
+# announced. Thresholds assume this box's measured equilibria (CPU ~66°C
+# at HIGH+140W; blower ~48°C at full+100W) — re-check after hardware moves.
+COOL_FAIL_WINDOW_S = 60
+COOL_FAIL_STUCK_S = 300
+COOL_RISE_WARN_C_PER_MIN = 0.3
+CPU_COOL_FLOOR = 70
+CPU_COOL_STUCK = 80
+GPU_COOL_FLOOR = 65
+GPU_COOL_STUCK = 80
+COOL_RECOVER_MARGIN = 12
+CPU_PRECRIT = 84              # °C — immediate (rate-limited) alert
+GPU_PRECRIT = 85
+
+# During a GPU cooling failure the fan is already maxed and the only lever
+# left is the heat source, so the card is power-capped; the previous limit
+# is remembered and restored on recovery. 0 = alert-only. The CPU is
+# deliberately NOT auto-throttled: trading serving performance away
+# automatically is the owner's call, not the fan daemon's.
+MITIGATE_GPU_POWER_LIMIT = 60  # W
+
+# Email alerts are optional; without --alert-email (or with an unreadable
+# creds file) the daemon runs alert-less and every event still hits the
+# journal. Sends are rate-limited per alert class so a flapping condition
+# cannot mailbomb; failures NEVER touch fan control.
+ALERT_EMAIL = None
+SMTP_CREDS_FILE = "/etc/v100-fan-control/smtp_password"
+SMTP_SENDER = "theminor.claw@gmail.com"
+SMTP_SERVER, SMTP_PORT = ("smtp.gmail.com", 587)
+ALERT_MIN_INTERVAL_S = 1800
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -221,6 +267,21 @@ def parse_args():
         "--cpu-pwm", type=int, default=None, metavar="N",
         help="Enable CPU-fan control on pwmN of the same fan chip (T5810: "
              "--cpu-pwm 1), using the coretemp two-level CPU thermostat"
+    )
+    parser.add_argument(
+        "--alert-email", default=None, metavar="ADDR",
+        help="Email alerts for cooling failure, fan stall, pre-critical "
+             "temps, and telemetry loss. Needs the app-password file at "
+             "--smtp-creds. Rate-limited per alert class."
+    )
+    parser.add_argument(
+        "--smtp-creds", default=None, metavar="PATH",
+        help="Path to a chmod-600 file holding the Gmail app password "
+             f"(default {SMTP_CREDS_FILE})"
+    )
+    parser.add_argument(
+        "--test-email", action="store_true",
+        help="Send one test alert via the configured path, then exit"
     )
     return parser.parse_args()
 
@@ -701,6 +762,12 @@ def tach_feedback(key, pwm_file, commanded, debug):
                     "Fan %s: commanded PWM %d but %d tach reads failed — fan "
                     "stopped? Forcing PWM %d", key, commanded, tach_errors[key], PWM_MAX,
                 )
+                send_alert(
+                    f"stall-{key}", f"FAN STALL: channel {key} not spinning",
+                    f"Fan channel {key} produced no tach pulses while commanded "
+                    f"to duty {commanded}. The daemon has forced it to maximum "
+                    f"PWM. Check the fan and its power connection. "
+                    f"Telemetry: journalctl -u {SERVICE_NAME}")
                 current_pwms[key] = PWM_MAX
                 command_fan(key, pwm_file, PWM_MAX, force=True)
         return
@@ -721,10 +788,162 @@ def tach_feedback(key, pwm_file, commanded, debug):
         logger.info("Fan %s: tach=%d RPM%s", key, rpm, " (grace)" if in_grace else "")
 
 
+# ---------------------------------------------------------------------------
+#  Email alerts
+# ---------------------------------------------------------------------------
+
+alert_last_sent = {}
+
+
+def send_alert(kind, subject, body):
+    """Rate-limited email alert; never raises. A timestamp is recorded on
+    FAILURE too, so a dead SMTP relay cannot turn every poll cycle into a
+    connection storm. Everything this reports is also in the journal."""
+    if not ALERT_EMAIL:
+        return
+    now = time.time()
+    if now - alert_last_sent.get(kind, 0.0) < ALERT_MIN_INTERVAL_S:
+        return
+    alert_last_sent[kind] = now
+    try:
+        import smtplib
+        from email.message import EmailMessage
+        with open(SMTP_CREDS_FILE) as f:
+            password = f.read().strip()
+        msg = EmailMessage()
+        msg["From"] = SMTP_SENDER
+        msg["To"] = ALERT_EMAIL
+        msg["Subject"] = f"[{SERVICE_NAME} @{HOSTNAME}] {subject}"
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_SENDER, password)
+            s.send_message(msg)
+        logger.info("Alert email sent (%s): %s", kind, subject)
+    except Exception as e:
+        logger.error("Alert email failed (%s): %s", kind, e)
+
+
+# ---------------------------------------------------------------------------
+#  Cooling-effectiveness watchdog
+# ---------------------------------------------------------------------------
+
+temp_hist = {}       # key -> list[(monotonic, temp_c)], pruned to ~6 min
+high_since = {}      # key -> monotonic since the channel entered HIGH
+cooling_fault = {}   # key -> dict(declared_at[, power_limit_restored])
+
+
+def gpu_set_power_limit(gpu_idx, watts=None):
+    """Query (watts=None) or set the card's power limit in W. Returns the
+    resulting limit as float, or None on failure."""
+    cmd = ["nvidia-smi", "-i", str(gpu_idx)]
+    if watts is None:
+        cmd += ["--query-gpu=power.limit", "--format=csv,noheader,nounits"]
+    else:
+        cmd += ["-pl", str(watts)]
+    try:
+        out = subprocess.check_output(cmd, encoding="utf-8", timeout=15)
+        if watts is None:
+            return float(out.strip().splitlines()[0])
+        logger.info("GPU %d: power limit set to %s W", gpu_idx, watts)
+        return float(watts)
+    except Exception as e:
+        logger.error("GPU %d power-limit %s failed: %s", gpu_idx,
+                     "query" if watts is None else f"set {watts}W", e)
+        return None
+
+
+def cooling_monitor(key, temp, commanded, debug=False):
+    """Per-cycle cooling-effectiveness check for one channel.
+
+    Fan-stopping is the tach watchdog's job; this catches the failure the
+    tach CANNOT see: air moving at maximum while heat stops leaving. See
+    the constants block for the rule and its thresholds."""
+    now = time.monotonic()
+    is_cpu = key == CPU_KEY
+    floor = CPU_COOL_FLOOR if is_cpu else GPU_COOL_FLOOR
+    stuck = CPU_COOL_STUCK if is_cpu else GPU_COOL_STUCK
+    precrit = CPU_PRECRIT if is_cpu else GPU_PRECRIT
+    high_value = CPU_DUTY_HIGH if is_cpu else PWM_MAX
+    label = "CPU" if is_cpu else f"GPU {key}"
+
+    hist = temp_hist.setdefault(key, [])
+    hist.append((now, temp))
+    while hist and hist[0][0] < now - 360:
+        hist.pop(0)
+
+    if temp >= precrit:
+        send_alert(
+            f"precrit-{key}", f"PRE-CRITICAL {label} temperature {temp}C",
+            f"{label} is at {temp}C (pre-critical threshold {precrit}C) while "
+            f"the fan is commanded to duty {commanded}. Check the machine. "
+            f"Telemetry: journalctl -u {SERVICE_NAME}")
+
+    high = commanded >= high_value
+
+    if key in cooling_fault:
+        if temp <= floor - COOL_RECOVER_MARGIN:
+            fault = cooling_fault.pop(key)
+            high_since.pop(key, None)
+            note = ""
+            if "power_limit_restored" in fault:
+                note = f"\nGPU power limit restored to {fault['power_limit_restored']:.0f} W."
+            logger.warning("Cooling recovered on %s (%d C)", label, temp)
+            send_alert(
+                f"coolfail-{key}",
+                f"RECOVERED: {label} cooling back in range ({temp}C)",
+                f"{label} cooling-failure condition cleared at {temp}C "
+                f"(floor {floor}C minus margin {COOL_RECOVER_MARGIN}C).{note}")
+        return
+
+    if not high:
+        high_since.pop(key, None)
+        return
+
+    t_high = high_since.setdefault(key, now)
+    if now - t_high < COOL_FAIL_WINDOW_S:
+        return
+
+    # Slope (C/min) over the most recent <=90 s of history. Requiring a
+    # span >=30 s avoids dividing by a nearly-empty window.
+    t_ref, ref = hist[0]
+    for h, v in reversed(hist):
+        if now - h <= 90:
+            t_ref, ref = h, v
+        else:
+            break
+    span = now - t_ref
+    slope = ((temp - ref) / span * 60) if span >= 30 else 0.0
+
+    rising = temp >= floor and slope >= COOL_RISE_WARN_C_PER_MIN
+    stuck_hot = temp >= stuck and (now - t_high) >= COOL_FAIL_STUCK_S
+    if not (rising or stuck_hot):
+        return
+
+    why = (f"temperature RISING {slope:.1f} C/min at {temp}C" if rising
+           else f"stuck at {temp}C for {(now - t_high) / 60:.0f} min")
+    cooling_fault[key] = {"declared_at": now}
+    logger.critical("COOLING FAILURE on %s: fan at max duty %d but %s",
+                    label, commanded, why)
+    body = (f"{label}: commanded to maximum fan duty ({commanded}) but {why} "
+            f"(rising-floor {floor}C, stuck-floor {stuck}C).\n"
+            "Heat may not be leaving the system despite the fan spinning "
+            "(mount/paste/flow failure), or the load exceeds the cooling "
+            f"envelope. Check the machine. Telemetry: journalctl -u {SERVICE_NAME}")
+    if (not is_cpu) and MITIGATE_GPU_POWER_LIMIT:
+        orig = gpu_set_power_limit(key)
+        if gpu_set_power_limit(key, MITIGATE_GPU_POWER_LIMIT) is not None and orig is not None:
+            cooling_fault[key]["power_limit_restored"] = orig
+            body += (f"\nAuto-mitigation: GPU power limit lowered {orig:.0f} W"
+                     f" -> {MITIGATE_GPU_POWER_LIMIT} W; it will be restored "
+                     "automatically when cooling recovers.")
+    send_alert(f"coolfail-{key}", f"COOLING FAILURE: {label} at {temp}C", body)
+
+
 def main():
     global FAN_MAP
     global PWM_MIN, PWM_MAX, POLL_INTERVAL, HWMON_DEVICE, GPU_TO_PWM
-    global CPU_TO_PWM, CPU_PWM_FILE
+    global CPU_TO_PWM, CPU_PWM_FILE, ALERT_EMAIL, SMTP_CREDS_FILE
 
     args = parse_args()
 
@@ -744,6 +963,20 @@ def main():
 
     setup_logging()  # attaches handlers to the module logger singleton
     logger.setLevel(logging.INFO if args.debug else logging.WARNING)
+
+    if args.alert_email:
+        ALERT_EMAIL = args.alert_email
+    if args.smtp_creds:
+        SMTP_CREDS_FILE = args.smtp_creds
+    if args.test_email:
+        if not ALERT_EMAIL:
+            print("--test-email requires --alert-email ADDR")
+            sys.exit(2)
+        logger.setLevel(logging.INFO)
+        send_alert("test", "TEST alert — email path is working",
+                   f"This is a test alert from {SERVICE_NAME} on {HOSTNAME}. "
+                   "If you received it, production alerts will reach you too.")
+        return
 
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -913,6 +1146,9 @@ def main():
                         # Tach feedback: shared stall/deviation watchdog
                         tach_feedback(gpu_idx, pwm_file, commanded, args.debug)
 
+                        # Cooling effectiveness: fan maxed but heat not leaving?
+                        cooling_monitor(gpu_idx, temp, commanded, args.debug)
+
             else:
                 consecutive_errors += 1
                 logger.warning("No GPU temps read (Error #%d) — skipping cycle", consecutive_errors)
@@ -922,6 +1158,12 @@ def main():
                         "GPU temps unreadable — forcing PWM_MAX on all mapped "
                         "fans until telemetry recovers (fail loud)."
                     )
+                    send_alert(
+                        "loss-gpu", "GPU temperature telemetry lost",
+                        f"{SERVICE_NAME} on {HOSTNAME} cannot read GPU "
+                        "temperatures (nvidia-smi/NVML failing). All mapped "
+                        "GPU fans are being forced to maximum until telemetry "
+                        "recovers.")
                     for gpu_idx, pwm_file in FAN_MAP.items():
                         current_pwms[gpu_idx] = PWM_MAX
                         command_fan(gpu_idx, pwm_file, PWM_MAX, force=True)
@@ -940,6 +1182,11 @@ def main():
                     cpu_errors += 1
                     if cpu_errors == FAILSAFE_TEMP_ERRORS:
                         logger.error("CPU temp unreadable — commanding CPU fan HIGH (fail loud).")
+                        send_alert(
+                            "loss-cpu", "CPU temperature telemetry lost",
+                            f"{SERVICE_NAME} on {HOSTNAME} cannot read coretemp. "
+                            "The CPU fan is being held at HIGH duty until the "
+                            "sensor returns. Check the machine.")
                         command_fan(CPU_KEY, CPU_PWM_FILE, CPU_DUTY_HIGH, force=True)
                 else:
                     cpu_errors = 0
@@ -949,6 +1196,7 @@ def main():
                     if args.debug and commanded_cpu != prev_cpu:
                         logger.info("CPU: temp=%d°C -> duty %d", ct, commanded_cpu)
                     tach_feedback(CPU_KEY, CPU_PWM_FILE, commanded_cpu, args.debug)
+                    cooling_monitor(CPU_KEY, ct, commanded_cpu, args.debug)
 
             time.sleep(POLL_INTERVAL)
 
