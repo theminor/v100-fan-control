@@ -161,6 +161,24 @@ GPU_TO_PWM = {
     1: 1,  # GPU 1 (x4 slot) → PWM channel 1
 }
 
+# ============================================================
+#  CPU FAN — optional CPU-channel control (T5810 Dell SMM)
+# ============================================================
+
+# On the T5810 the EC pins the CPU fan (pwm1) at ~1,030 RPM in BIOS "Low"
+# mode regardless of load; a 30-min all-core soak reached 95 °C with
+# continuous throttling. The CPU channel's measured duty ladder is BINARY:
+#   duty ≤ 160 → ≈1,015 RPM (EC pinned level) ; duty ≥ 192 → ≈4,300 RPM
+# So the CPU policy is a two-level thermostat. Enable with --cpu-pwm 1.
+CPU_TO_PWM = None             # pwm channel number for the CPU fan; None = off
+CPU_CHIP_NAME = "coretemp"    # hwmon chip carrying the CPU package temp
+CPU_T_HOT = 75                # °C — command HIGH at/above
+CPU_T_COOL = 68               # °C — drop to LOW at/below; between = hold
+CPU_DUTY_LOW = 160            # ≈1,015 RPM on the T5810 CPU fan
+CPU_DUTY_HIGH = 224           # ≈4,300 RPM on the T5810 CPU fan
+CPU_BAND_LOW = (800, 1400)    # settled-RPM band checks for the CPU channel
+CPU_BAND_HIGH = (3600, 5200)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -195,6 +213,11 @@ def parse_args():
     parser.add_argument(
         "--poll-interval", type=int, default=None, metavar="S",
         help="Override POLL_INTERVAL seconds"
+    )
+    parser.add_argument(
+        "--cpu-pwm", type=int, default=None, metavar="N",
+        help="Enable CPU-fan control on pwmN of the same fan chip (T5810: "
+             "--cpu-pwm 1), using the coretemp two-level CPU thermostat"
     )
     return parser.parse_args()
 
@@ -598,12 +621,107 @@ def calculate_pwm(temp):
 # Same singleton object setup_logging() configures below; binding it here
 # means every function can use it once handlers are attached in main().
 logger = logging.getLogger("v100-fan")
-FAN_MAP = {}       # set in main()
+FAN_MAP = {}        # set in main()
+CPU_PWM_FILE = None  # set in main() when --cpu-pwm is used
+CPU_KEY = "cpu"      # bookkeeping key for the CPU channel (cannot collide with GPU indices)
+current_pwms = {}   # Tracks the actual running speed of each fan for smoothing
+tach_errors = {}    # key -> consecutive tach failures (stall watchdog)
+tach_dev = {}       # key -> consecutive out-of-band settled reads
+
+
+def get_cpu_temp():
+    """CPU package temperature in °C from the coretemp hwmon chip (max of
+    its temp*_input entries), or None if unreadable."""
+    try:
+        for d in glob.glob("/sys/class/hwmon/hwmon*/"):
+            try:
+                with open(os.path.join(d, "name")) as f:
+                    if f.read().strip() != CPU_CHIP_NAME:
+                        continue
+            except OSError:
+                continue
+            vals = []
+            for t in glob.glob(os.path.join(d, "temp*_input")):
+                try:
+                    vals.append(int(open(t).read().strip()))
+                except (OSError, ValueError):
+                    pass
+            if vals:
+                return max(vals) // 1000
+        return None
+    except Exception as e:
+        logger.error("CPU temp read failed: %s", e)
+        return None
+
+
+def cpu_duty(temp, prev):
+    """Two-level CPU thermostat (the T5810 CPU channel has no usable middle
+    level): >= CPU_T_HOT full, <= CPU_T_COOL low, hold in between."""
+    if temp >= CPU_T_HOT:
+        return CPU_DUTY_HIGH
+    if temp <= CPU_T_COOL:
+        return CPU_DUTY_LOW
+    return prev if prev is not None else CPU_DUTY_LOW
+
+
+def band_for(key, duty):
+    """Settled-RPM band for a channel: CPU uses its own measured ladder,
+    GPU channels use the blower bands."""
+    if key == CPU_KEY:
+        if duty >= CPU_DUTY_HIGH:
+            return CPU_BAND_HIGH
+        if duty >= CPU_DUTY_LOW:
+            return CPU_BAND_LOW
+        return None
+    return expected_band(duty)
+
+
+def tach_feedback(key, pwm_file, commanded, debug):
+    """Shared stall/deviation watchdog for one channel.
+
+    Grace window after ANY write: EC level transitions make tach reads
+    unreliable (they can even error briefly) — judging during grace is how
+    you get false stall alarms.
+      armed + repeated errors        -> stalled fan -> force PWM_MAX
+      settled out-of-band repeatedly -> re-issue the same command once
+    """
+    tach = tach_file_for(pwm_file)
+    if not tach or commanded < TACH_ARM_DUTY:
+        return
+    in_grace = (time.monotonic() - last_command_time.get(key, 0.0)) < DELL_KICK_GRACE_S
+    rpm = read_tach(tach)
+    if rpm is None:
+        if not in_grace:
+            tach_errors[key] = tach_errors.get(key, 0) + 1
+            if tach_errors[key] >= TACH_ERRORS_TO_ESCALATE:
+                logger.error(
+                    "Fan %s: commanded PWM %d but %d tach reads failed — fan "
+                    "stopped? Forcing PWM %d", key, commanded, tach_errors[key], PWM_MAX,
+                )
+                current_pwms[key] = PWM_MAX
+                command_fan(key, pwm_file, PWM_MAX, force=True)
+        return
+    tach_errors[key] = 0
+    band = band_for(key, commanded)
+    if not in_grace and band and not (band[0] <= rpm <= band[1]):
+        tach_dev[key] = tach_dev.get(key, 0) + 1
+        if tach_dev[key] >= TACH_DEV_SAMPLES:
+            logger.warning(
+                "Fan %s: settled tach %d RPM outside band %s for duty %d — "
+                "re-issuing command", key, rpm, band, commanded,
+            )
+            command_fan(key, pwm_file, commanded, force=True)
+            tach_dev[key] = 0
+    else:
+        tach_dev[key] = 0
+    if debug:
+        logger.info("Fan %s: tach=%d RPM%s", key, rpm, " (grace)" if in_grace else "")
 
 
 def main():
     global FAN_MAP
     global PWM_MIN, PWM_MAX, POLL_INTERVAL, HWMON_DEVICE, GPU_TO_PWM
+    global CPU_TO_PWM, CPU_PWM_FILE
 
     args = parse_args()
 
@@ -618,6 +736,8 @@ def main():
         PWM_MAX = args.pwm_max
     if args.poll_interval is not None:
         POLL_INTERVAL = args.poll_interval
+    if args.cpu_pwm is not None:
+        CPU_TO_PWM = args.cpu_pwm
 
     setup_logging()  # attaches handlers to the module logger singleton
     logger.setLevel(logging.INFO if args.debug else logging.WARNING)
@@ -692,6 +812,23 @@ def main():
     if guards:
         verify_gpu_pci(guards)
 
+    # Optional CPU channel (same fan chip, coretemp as its temperature source)
+    if CPU_TO_PWM is not None:
+        if CPU_TO_PWM not in pwm_channel_to_file:
+            logger.error(
+                "CPU pwm channel %d does not exist. Available channels: %s",
+                CPU_TO_PWM, [p for p, _ in available_pwms],
+            )
+            sys.exit(1)
+        CPU_PWM_FILE = pwm_channel_to_file[CPU_TO_PWM]
+        if get_cpu_temp() is None:
+            logger.error("CPU channel enabled but no %s temperature is readable", CPU_CHIP_NAME)
+            sys.exit(1)
+        logger.info(
+            "CPU fan: %s — two-level thermostat (>= %d°C HIGH, <= %d°C LOW, hold between)",
+            os.path.basename(CPU_PWM_FILE), CPU_T_HOT, CPU_T_COOL,
+        )
+
     logger.info("Fan mapping:")
     for gpu_idx, pwm_file in FAN_MAP.items():
         tach = tach_file_for(pwm_file)
@@ -712,9 +849,10 @@ def main():
     logger.info("Fan control loop started")
 
     consecutive_errors = 0
-    current_pwms = {}   # Tracks the actual running speed of each fan for smoothing
-    tach_errors = {}    # gpu_idx -> consecutive tach failures (Dell watchdog)
-    tach_dev = {}       # gpu_idx -> consecutive out-of-band settled reads
+    cpu_errors = 0
+    current_pwms.clear()
+    tach_errors.clear()
+    tach_dev.clear()
 
     try:
         while True:
@@ -769,43 +907,8 @@ def main():
                                     gpu_idx, temp, target_pwm, commanded,
                                 )
 
-                        # Tach feedback (both modes). Grace period first: right after any
-                        # write the EC is mid-transition and tach reads are
-                        # unreliable (they can even error briefly).
-                        #   armed + errors  -> stalled fan -> force PWM_MAX
-                        #   settled out-of-band -> re-issue same command once
-                        tach = tach_file_for(pwm_file)
-                        if tach and commanded >= TACH_ARM_DUTY:
-                            in_grace = (time.monotonic() - last_command_time.get(gpu_idx, 0.0)) < DELL_KICK_GRACE_S
-                            rpm = read_tach(tach)
-                            if rpm is None:
-                                if not in_grace:
-                                    tach_errors[gpu_idx] = tach_errors.get(gpu_idx, 0) + 1
-                                    if tach_errors[gpu_idx] >= TACH_ERRORS_TO_ESCALATE:
-                                        logger.error(
-                                            "GPU %d: commanded PWM %d but %d tach "
-                                            "reads failed — fan stopped? Forcing PWM %d",
-                                            gpu_idx, commanded, tach_errors[gpu_idx], PWM_MAX,
-                                        )
-                                        current_pwms[gpu_idx] = PWM_MAX
-                                        command_fan(gpu_idx, pwm_file, PWM_MAX, force=True)
-                            else:
-                                tach_errors[gpu_idx] = 0
-                                band = expected_band(commanded)
-                                if not in_grace and band and not (band[0] <= rpm <= band[1]):
-                                    tach_dev[gpu_idx] = tach_dev.get(gpu_idx, 0) + 1
-                                    if tach_dev[gpu_idx] >= TACH_DEV_SAMPLES:
-                                        logger.warning(
-                                            "GPU %d: settled tach %d RPM outside band %s "
-                                            "for commanded duty %d — re-issuing command",
-                                            gpu_idx, rpm, band, commanded,
-                                        )
-                                        command_fan(gpu_idx, pwm_file, commanded, force=True)
-                                        tach_dev[gpu_idx] = 0
-                                else:
-                                    tach_dev[gpu_idx] = 0
-                                if args.debug:
-                                    logger.info("GPU %d: tach=%d RPM%s", gpu_idx, rpm, " (grace)" if in_grace else "")
+                        # Tach feedback: shared stall/deviation watchdog
+                        tach_feedback(gpu_idx, pwm_file, commanded, args.debug)
 
             else:
                 consecutive_errors += 1
@@ -826,6 +929,23 @@ def main():
                         "Forcing service restart to clear driver state..."
                     )
                     sys.exit(1)
+
+            # --- CPU channel (independent of GPU telemetry) ---
+            if CPU_PWM_FILE is not None:
+                ct = get_cpu_temp()
+                if ct is None:
+                    cpu_errors += 1
+                    if cpu_errors == FAILSAFE_TEMP_ERRORS:
+                        logger.error("CPU temp unreadable — commanding CPU fan HIGH (fail loud).")
+                        command_fan(CPU_KEY, CPU_PWM_FILE, CPU_DUTY_HIGH, force=True)
+                else:
+                    cpu_errors = 0
+                    prev_cpu = last_written.get(CPU_KEY)
+                    commanded_cpu = cpu_duty(ct, prev_cpu)
+                    command_fan(CPU_KEY, CPU_PWM_FILE, commanded_cpu)
+                    if args.debug and commanded_cpu != prev_cpu:
+                        logger.info("CPU: temp=%d°C -> duty %d", ct, commanded_cpu)
+                    tach_feedback(CPU_KEY, CPU_PWM_FILE, commanded_cpu, args.debug)
 
             time.sleep(POLL_INTERVAL)
 

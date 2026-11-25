@@ -227,13 +227,17 @@ Description=V100 PCIe blower fan control (Dell SMM pwm5)
 After=multi-user.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/john/v100-fan-control/v100_fan_control.py --hwmon-device dell_smm_hwmon --gpu-map 0:5 --gpu-pci 0=0000:03:00.0 --pwm-min 160
+ExecStart=/usr/bin/python3 /home/john/v100-fan-control/v100_fan_control.py --hwmon-device dell_smm_hwmon --gpu-map 0:5 --gpu-pci 0=0000:03:00.0 --pwm-min 160 --cpu-pwm 1
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+### CPU fan channel (`--cpu-pwm 1`)
+
+BIOS "Low" mode pins the CPU fan too (~1,030 RPM regardless of load) — a 30-minute all-core soak on the T5810 hit **95 °C with continuous throttling** at that pin. `--cpu-pwm 1` adds an independent two-level thermostat driven by coretemp: at/above `CPU_T_HOT` (default 75 °C) command HIGH, at/below `CPU_T_COOL` (68 °C) return to LOW, hold in between. Measured CPU-channel duty ladder on the T5810 is **binary**: ≤160 → ≈1,015 RPM, ≥192 → ≈4,300 RPM (no usable middle). Ladders are fan- and board-specific — measure before choosing duties on any other machine; the same write-on-change, kick-grace, and tach-deviation discipline applies.
 
 ## Command-Line Options
 
@@ -247,6 +251,7 @@ CLI flags override the corresponding `SETTINGS` constants, so one script copy se
 | `--pwm-min N` | `PWM_MIN` | `160` on Dell SMM / V100 blower |
 | `--pwm-max N` | `PWM_MAX` | `255` |
 | `--poll-interval S` | `POLL_INTERVAL` | `3` |
+| `--cpu-pwm N` | enables CPU channel | `1` on the T5810 — two-level CPU thermostat via coretemp |
 | `--debug` | — | verbose logging every cycle |
 
 ## Settings Reference
@@ -266,6 +271,8 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_FILE` | `/var/log/v100-fan.log` | Log file path |
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
+| `CPU_T_HOT` / `CPU_T_COOL` | 75 / 68 | With `--cpu-pwm`: °C thresholds for the two-level CPU thermostat (hold between) |
+| `CPU_DUTY_LOW` / `CPU_DUTY_HIGH` | 160 / 224 | CPU channel duties (T5810-measured ladder: ≈1,015 / ≈4,300 RPM) |
 | `DELL_T_HOT` | 50 | Dell mode: °C at/above which the blower is commanded full |
 | `DELL_T_COOL` | 44 | Dell mode: °C at/below which the blower is commanded low; between = hold |
 | `DELL_DUTY_LEVELS` | (96, 160, 255) | Duty written for EC levels 0/1/2 |
