@@ -195,7 +195,7 @@ Three things differ from Super I/O boards and matter:
 
 3. **BIOS Fan Control mode must be "Low".** With BIOS mode "Auto" the EC reclaims the channel seconds after any write (observed sawtooth 1,300→~170 RPM on a 30 s cycle) and ignores sustained control; "Low" mode holds our commanded level indefinitely. There is no Linux-side way to disable the EC's auto policy on this platform (no `pwmN_enable` interface), so this is a **deployment prerequisite**, not a preference.
 
-4. **Rapid repeated writes stall the fan — write only on change.** Each SMM duty write is an EC *command* with a ~10–25 s kick/transition; writing the same value every second drove the blower to a stop. In Dell mode the script therefore writes only when the commanded duty **changes**, judges tach only after a `DELL_KICK_GRACE_S` grace window, and re-issues a command solely when settled tach sits outside the expected band (`TACH_BANDS`) for `TACH_DEV_SAMPLES` reads. Super I/O behavior is unchanged.
+4. **Rapid repeated writes stall the fan — Dell mode is a 3-level thermostat.** Each SMM duty write is an EC *command* with a ~10–25 s kick/transition; writing the same value every second drove the blower to a stop. Worse, this card's idle/load temperatures (≈43/≈53 °C) straddle the EC's two usable levels, so an interpolated duty curve **limit-cycles** (verified: fan flapped every ~40 s under a 100 W burn). Dell mode therefore commands one of three levels via `dell_duty()`: temp ≥ `DELL_T_HOT` → full (255), temp ≤ `DELL_T_COOL` → low (160), in between → hold the current level. Writes happen only on level *change* (plus a 3600 s ceiling refresh and tach-deviation re-issue after a 25 s kick grace). Super I/O keeps its original linear-curve-every-cycle behavior.
 
 5. **The EC keeps its own policy** (in Low mode, a fixed baseline; the earlier "sniff" excursions belong to Auto). The daemon reacts to GPU temperature, which the EC cannot see.
 
@@ -266,9 +266,12 @@ All settings are at the top of `v100_fan_control.py` under the `# SETTINGS` sect
 | `LOG_FILE` | `/var/log/v100-fan.log` | Log file path |
 | `LOG_MAX_BYTES` | 5 MB | Log rotation size |
 | `LOG_BACKUP_COUNT` | 3 | Number of rotated log files to keep |
+| `DELL_T_HOT` | 50 | Dell mode: °C at/above which the blower is commanded full |
+| `DELL_T_COOL` | 44 | Dell mode: °C at/below which the blower is commanded low; between = hold |
+| `DELL_DUTY_LEVELS` | (96, 160, 255) | Duty written for EC levels 0/1/2 |
 | `TACH_ARM_DUTY` | 96 | Above this commanded duty, tach failures count toward stall escalation |
 | `TACH_ERRORS_TO_ESCALATE` | 3 | Consecutive tach failures (armed) before forcing `PWM_MAX` |
-| `DELL_REENFORCE_S` | 30 | Dell SMM: seconds between same-value re-enforcement writes (value *changes* always write immediately) |
+| `DELL_REENFORCE_S` | 3600 | Dell SMM: hard ceiling seconds for same-level re-writes (normally only level *changes* write) |
 | `FAILSAFE_TEMP_ERRORS` | 3 | Consecutive unreadable-temp cycles before forcing `PWM_MAX` on all mapped fans |
 | `RESTART_AFTER_TEMP_ERRORS` | 10 | Consecutive unreadable cycles before exiting nonzero for systemd restart |
 

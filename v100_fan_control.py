@@ -105,15 +105,16 @@ TACH_ERRORS_TO_ESCALATE = 3
 DELL_REENFORCE_S = 3600     # hard ceiling for same-value re-writes
 DELL_KICK_GRACE_S = 25      # after any write, tach is transitioning: don't judge
 TACH_DEV_SAMPLES = 3        # consecutive out-of-band settled reads -> re-issue
-# Level hysteresis: with kick-costly EC writes the smoothed duty oscillating
-# across a level boundary (load equilibrium temp near a threshold) produces a
-# kick every crossing — observed fan flapping under a 100 W burn. Dell mode
-# therefore only lets the commanded level DROP once the raw curve target is
-# LEVEL_HYST below the duty where the drop would happen; otherwise it holds
-# at the current level's floor. (Measured: level 2 engages at 192 duty = 52°C;
-# it then holds full fan until the target implies < ~46°C.)
-LEVEL_FLOOR = (0, 112, 192)  # min duty of EC levels 0, 1, 2
-LEVEL_HYST = 15              # duty of extra clearance required to drop a level
+# The EC gives us ~3 usable levels, and this card's idle/load delta
+# (≈43 vs ≈53 °C) straddles any duty-interpolated curve — a linear curve
+# limit-cycles (proven with a 100 W burn: fan flapped every ~40 s). Dell
+# mode is therefore a 3-level thermostat with a HOLD ZONE: at or above
+# DELL_T_HOT go full; at or below DELL_T_COOL go low; in between keep the
+# current level. The zone (44-50 °C) contains both equilibria, so there is
+# nothing left to oscillate around under sustained load.
+DELL_T_HOT = 50      # °C — rise to full level at/above
+DELL_T_COOL = 44     # °C — fall to low level at/below
+DELL_DUTY_LEVELS = (96, 160, 255)  # duty written for EC levels 0, 1, 2
 # Settled RPM bands by commanded duty (T5810 PCIe blower, Low mode; the EC
 # quantizes: canonical levels ~<112 → ≈130 RPM (often below the tach's
 # readable floor), 112–191 → ≈505 RPM, ≥192 → ≈4100 RPM):
@@ -409,6 +410,27 @@ def command_fan(gpu_idx, pwm_file, pwm_value, force=False):
         last_command_time[gpu_idx] = now
 
 
+def dell_duty(temp, prev_duty):
+    """Dell-mode thermostat: temperature -> commanded duty (3 EC levels).
+
+    >= DELL_T_HOT rises to full; <= DELL_T_COOL falls to low (level 0 only
+    if PWM_MIN is below the 112 boundary); inside the hold zone the previous
+    level is kept, so a load whose equilibrium sits inside the zone produces
+    exactly ONE transition and never cycles."""
+    cold_level = 0 if PWM_MIN < 112 else 1
+    if temp >= DELL_T_HOT:
+        level = 2
+    elif temp <= DELL_T_COOL:
+        level = cold_level
+    elif prev_duty is None:
+        level = cold_level
+    else:
+        level = dell_level(prev_duty)
+    if dell_level(PWM_MAX) < 2 and level == 2:
+        level = dell_level(PWM_MAX)   # operator clamped PWM_MAX below full
+    return DELL_DUTY_LEVELS[level]
+
+
 def expected_band(cmd_pwm):
     """Settled-RPM band (lo, hi) for a commanded duty, or None when the
     expected level is too slow for the tach to be a reliable judge."""
@@ -702,47 +724,58 @@ def main():
                 consecutive_errors = 0  # Reset counter on success
                 for gpu_idx, temp in gpu_temps.items():
                     if gpu_idx in FAN_MAP:
-                        target_pwm = calculate_pwm(temp)
+                        pwm_file = FAN_MAP[gpu_idx]
+                        is_dell = not has_enable_interface(pwm_file)
 
-                        # Initialize tracking on first loop
-                        if gpu_idx not in current_pwms:
-                            current_pwms[gpu_idx] = target_pwm
-
-                        # Acoustic Smoothing Logic
-                        diff = target_pwm - current_pwms[gpu_idx]
-
-                        if diff > 0:
-                            # Needs to speed up — limit the jump to MAX_STEP_UP
-                            step = min(diff, MAX_STEP_UP)
-                        elif diff < 0:
-                            # Needs to slow down — limit the drop to MAX_STEP_DOWN
-                            step = max(diff, -MAX_STEP_DOWN)
+                        if is_dell:
+                            # 3-level thermostat (see DELL_T_HOT/T_COOL). No
+                            # smoothing: EC levels kick on ANY write, and the
+                            # hold zone already prevents chatter.
+                            commanded = dell_duty(temp, last_written.get(gpu_idx))
+                            command_fan(gpu_idx, pwm_file, commanded)
+                            if args.debug and commanded != last_written.get(gpu_idx):
+                                logger.info("GPU %d: Temp=%d°C -> level duty %d",
+                                            gpu_idx, temp, commanded)
                         else:
-                            step = 0
+                            # Original Super I/O path: linear curve + acoustic
+                            # smoothing, written every cycle.
+                            target_pwm = calculate_pwm(temp)
 
-                        smoothed_pwm = current_pwms[gpu_idx] + step
+                            # Initialize tracking on first loop
+                            if gpu_idx not in current_pwms:
+                                current_pwms[gpu_idx] = target_pwm
 
-                        # Dell level hysteresis: don't drop a level unless the
-                        # raw target is clearly past the boundary (see
-                        # LEVEL_HYST). Freezes the coast until release.
-                        is_dell = not has_enable_interface(FAN_MAP[gpu_idx])
-                        lw = last_written.get(gpu_idx)
-                        if (is_dell and lw is not None
-                                and dell_level(smoothed_pwm) < dell_level(lw)
-                                and target_pwm >= LEVEL_FLOOR[dell_level(lw)] - LEVEL_HYST):
-                            smoothed_pwm = LEVEL_FLOOR[dell_level(lw)]
+                            # Acoustic Smoothing Logic
+                            diff = target_pwm - current_pwms[gpu_idx]
 
-                        current_pwms[gpu_idx] = smoothed_pwm
+                            if diff > 0:
+                                # Needs to speed up — limit the jump to MAX_STEP_UP
+                                step = min(diff, MAX_STEP_UP)
+                            elif diff < 0:
+                                # Needs to slow down — limit the drop to MAX_STEP_DOWN
+                                step = max(diff, -MAX_STEP_DOWN)
+                            else:
+                                step = 0
 
-                        command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm)
+                            commanded = current_pwms[gpu_idx] + step
+                            current_pwms[gpu_idx] = commanded
 
-                        # Tach feedback. Grace period first: right after any
+                            command_fan(gpu_idx, pwm_file, commanded)
+
+                            # Debug output so you can watch the smoothing in real-time
+                            if args.debug and (is_dell or step != 0):
+                                logger.info(
+                                    "GPU %d: Temp=%d°C | Target=%d | Actual=%d",
+                                    gpu_idx, temp, target_pwm, commanded,
+                                )
+
+                        # Tach feedback (both modes). Grace period first: right after any
                         # write the EC is mid-transition and tach reads are
                         # unreliable (they can even error briefly).
                         #   armed + errors  -> stalled fan -> force PWM_MAX
                         #   settled out-of-band -> re-issue same command once
-                        tach = tach_file_for(FAN_MAP[gpu_idx])
-                        if tach and smoothed_pwm >= TACH_ARM_DUTY:
+                        tach = tach_file_for(pwm_file)
+                        if tach and commanded >= TACH_ARM_DUTY:
                             in_grace = (time.monotonic() - last_command_time.get(gpu_idx, 0.0)) < DELL_KICK_GRACE_S
                             rpm = read_tach(tach)
                             if rpm is None:
@@ -752,34 +785,27 @@ def main():
                                         logger.error(
                                             "GPU %d: commanded PWM %d but %d tach "
                                             "reads failed — fan stopped? Forcing PWM %d",
-                                            gpu_idx, smoothed_pwm, tach_errors[gpu_idx], PWM_MAX,
+                                            gpu_idx, commanded, tach_errors[gpu_idx], PWM_MAX,
                                         )
                                         current_pwms[gpu_idx] = PWM_MAX
-                                        command_fan(gpu_idx, FAN_MAP[gpu_idx], PWM_MAX, force=True)
+                                        command_fan(gpu_idx, pwm_file, PWM_MAX, force=True)
                             else:
                                 tach_errors[gpu_idx] = 0
-                                band = expected_band(smoothed_pwm)
+                                band = expected_band(commanded)
                                 if not in_grace and band and not (band[0] <= rpm <= band[1]):
                                     tach_dev[gpu_idx] = tach_dev.get(gpu_idx, 0) + 1
                                     if tach_dev[gpu_idx] >= TACH_DEV_SAMPLES:
                                         logger.warning(
                                             "GPU %d: settled tach %d RPM outside band %s "
                                             "for commanded duty %d — re-issuing command",
-                                            gpu_idx, rpm, band, smoothed_pwm,
+                                            gpu_idx, rpm, band, commanded,
                                         )
-                                        command_fan(gpu_idx, FAN_MAP[gpu_idx], smoothed_pwm, force=True)
+                                        command_fan(gpu_idx, pwm_file, commanded, force=True)
                                         tach_dev[gpu_idx] = 0
                                 else:
                                     tach_dev[gpu_idx] = 0
                                 if args.debug:
                                     logger.info("GPU %d: tach=%d RPM%s", gpu_idx, rpm, " (grace)" if in_grace else "")
-
-                        # Debug output so you can watch the smoothing in real-time
-                        if args.debug and step != 0:
-                            logger.info(
-                                "GPU %d: Temp=%d°C | Target=%d | Actual=%d (Step: %d)",
-                                gpu_idx, temp, target_pwm, smoothed_pwm, step,
-                            )
 
             else:
                 consecutive_errors += 1
